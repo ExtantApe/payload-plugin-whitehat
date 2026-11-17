@@ -6,7 +6,7 @@
 
 Tested: 38 tests (2 new), 5 mutation checks.
 
-## 0.2.1 (not released yet; 0.2.0 wasn't published, so they go out together)
+## 0.2.1 (never published on its own; released in 0.2.2)
 
 From a security review of 0.2.0. Whitehat's rule is that a check it couldn't make is "not checked", never "passed"; these places broke it.
 
@@ -18,7 +18,7 @@ From a security review of 0.2.0. Whitehat's rule is that a check it couldn't mak
 
 Tested: 36 tests (8 new; 7 of them fail without these changes, and the eighth checks that partial uploads leave alerts alone, which already held). Not yet run against a real site's suites.
 
-## 0.2.0 (not released yet)
+## 0.2.0 (never published on its own; released in 0.2.2)
 
 - **Alerts in the site's database.** The `whitehat` plugin adds a `whitehat-alerts` collection.
   - Findings are kept by fingerprint (check, role, path): a re-run updates an alert rather than adding one, and an alert resolves when its check passes.
