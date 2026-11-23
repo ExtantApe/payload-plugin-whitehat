@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-23: review-finding checks
+
+Suite: 38 tests before, 63 after (`npx vitest run`; `review.test.ts` on real Payload 3.92 and in-memory MongoDB, `lint.test.ts` on text).
+
+- **Promise and test.** Each check has a quiet case on a fixed variant and a firing case on a broken one. Response difference: same refusal passes; a message that says why, an event row only one identity leaves, a different status, shape or allowed-versus-refused each fire; ids and dates are masked; two server errors and equal roles are not checked. Transactions: ignored fires, refusing at start-up or at the write passes, transactions on or an unrelated error is not checked (uses an instance booted with `transactionOptions: false`). Back doors: bulk hole, access-only rule under `overrideAccess`, and a hook that needs a transaction each fire only their own probes; `holdsForServerCode` off skips the override probes. Host rules: truthy test fires on `{}`, a throw and a narrow where; `mayWiden` changes the result; the option is put back. Lint: truthy use, stored answer, negation, ternary, paginated find; quiet on `=== true`, `pagination: false`, `findByID`, comments and files without hooks; folder walk skips tests and node_modules.
+- **Skipped.** REST and GraphQL variants of the probes (callers can pass their own `run`); Payload internals; the formatting of `how` text beyond the parts a test matches.
+- **Clean-up.** Every Payload instance is destroyed and the Mongo server stopped in `afterAll`; the folder test removes its own temp folder.
+
 ## 2026-11-11: only an exact `true` from `access`
 
 Suite: 36 tests before, 38 after (`npx vitest run`; `alerts.test.ts` on real Payload 3.92 and in-memory MongoDB with made-up alerts and users).

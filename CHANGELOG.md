@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Review-finding checks (2026-11-23).** Generic checks for the bug classes that human security review found in three Payload plugins, for a plugin repo to run in its own tests or CI: `runResponseDifferenceProbe` (two identities differing in one property must get the same message, status, shape and readable result), `runTransactionCheck` (a plugin must refuse to start or write when the Mongo adapter has transactions off), `runServerBackDoorCheck` (bulk update and delete, `disableTransaction`, `overrideAccess`), `runHostRuleCheck` (`true`, `{}`, null, 0, an empty string, a throw and a narrow where fed into a host rule must not switch a default off) and `lintDirectory` / `lintSource` (a host answer used as any truthy value; a paginated `find` with `req` in a hook). Six new rows in `CHECKLIST.md`; how to run them is in `docs/review-checks.md`.
+
+Tested: 25 new tests on real Payload 3.92 and in-memory MongoDB, with a made-up fixture plugin that has a broken and a fixed variant for each check (each check is shown to fire and to stay quiet). Not tested: against a real plugin repo's own suite; GraphQL and REST variants of the probes (Local API only); the lint is a text heuristic and will miss code that hides a host hook behind another name.
+
 ## 0.2.2 (2026-11-11)
 
 - **Only an exact `true` from `access` lets someone see, snooze or retest alerts (2026-11-11).** Any truthy answer used to count, and the answer went to Payload as the alerts' read and update access as it was, so an object that looked like a query became the read filter. A thrown error answered 500. Now anything but `true`, an error included, is a 403, and the answer is never handed to Payload. There is still no default: `access` stays required. A site whose `access` returns something other than `true` for people it means to let in must return `true`.
