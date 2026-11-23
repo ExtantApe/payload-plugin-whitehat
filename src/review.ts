@@ -24,9 +24,11 @@ const TX_CODES = [112, 225, 244, 251, 256, 263, 290]
 const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult']
 
 const causesOf = (e: unknown): unknown[] => {
-  const x = e as { cause?: unknown; errors?: unknown } | null
+  const x = e as { cause?: unknown; errors?: unknown; errorResponse?: unknown } | null
   const list: unknown[] = []
   if (x?.cause !== undefined && x.cause !== null) list.push(x.cause)
+  // A driver error keeps the server's reply here, with its own `codeName`, `code`, `errorLabels` and `errmsg`.
+  if (x?.errorResponse !== undefined && x.errorResponse !== null) list.push(x.errorResponse)
   if (Array.isArray(x?.errors)) list.push(...x.errors)
   return list
 }
@@ -35,27 +37,57 @@ const labelsOf = (e: unknown): string[] => {
   return Array.isArray(l) ? l.map(String) : l instanceof Set ? [...l].map(String) : []
 }
 
+const MAX_DEPTH = 6
 /**
- * Whether an error is the database's own transaction trouble: a driver error with a transaction `codeName`
- * (NoSuchTransaction, WriteConflict ...), code, or `errorLabels` entry (TransientTransactionError), on the error
- * or on anything in its `cause` chain. Real driver errors carry the name only in those fields; their message
- * is plain text.
+ * Visits an error and everything nested in its `cause`, `errorResponse` and `errors`, breadth first, each object once
+ * (a cycle or a node shared by several parents is not walked again), to a bounded depth. Stops at the first node
+ * `test` accepts.
  */
-export function isTransactionError(error: unknown, depth = 0): boolean {
-  if (error === null || typeof error !== 'object' || depth > 6) return false
+function someNode(error: unknown, test: (node: unknown) => boolean): boolean {
+  const seen = new WeakSet<object>()
+  let level: unknown[] = [error]
+  for (let depth = 0; depth <= MAX_DEPTH && level.length > 0; depth++) {
+    const next: unknown[] = []
+    for (const node of level) {
+      if (node === null || node === undefined || (typeof node !== 'object' && typeof node !== 'string')) continue
+      if (typeof node === 'object') {
+        if (seen.has(node)) continue
+        seen.add(node)
+      }
+      if (test(node)) return true
+      if (typeof node === 'object') next.push(...causesOf(node))
+    }
+    level = next
+  }
+  return false
+}
+
+const ownTransactionError = (error: unknown): boolean => {
+  if (error === null || typeof error !== 'object') return false
   const e = error as { codeName?: unknown; code?: unknown; name?: unknown }
   if (TX_CODE_NAMES.includes(String(e.codeName)) || TX_CODE_NAMES.includes(String(e.name))) return true
   if (typeof e.code === 'number' && TX_CODES.includes(e.code) && (typeof e.codeName === 'string' || /^Mongo/.test(String(e.name)))) return true
-  if (labelsOf(error).some((l) => TX_LABELS.includes(l))) return true
-  return causesOf(error).some((c) => isTransactionError(c, depth + 1))
+  return labelsOf(error).some((l) => TX_LABELS.includes(l))
+}
+const ownDatabaseError = (error: unknown): boolean => {
+  if (error === null || typeof error !== 'object') return false
+  const e = error as { codeName?: unknown; name?: unknown }
+  return ownTransactionError(error) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || labelsOf(error).length > 0
+}
+
+/**
+ * Whether an error is the database's own transaction trouble: a driver error with a transaction `codeName`
+ * (NoSuchTransaction, WriteConflict ...), code, or `errorLabels` entry (TransientTransactionError), on the error,
+ * on its `errorResponse`, or on anything in its `cause` chain or `errors` list. Real driver errors carry the name
+ * only in those fields; their message is plain text.
+ */
+export function isTransactionError(error: unknown): boolean {
+  return someNode(error, ownTransactionError)
 }
 
 /** Whether an error comes from the database driver (Mongo's own errors, transaction or not): never the plugin saying no. */
-export function isDatabaseError(error: unknown, depth = 0): boolean {
-  if (error === null || typeof error !== 'object' || depth > 6) return false
-  const e = error as { codeName?: unknown; name?: unknown }
-  if (isTransactionError(error) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || labelsOf(error).length > 0) return true
-  return causesOf(error).some((c) => isDatabaseError(c, depth + 1))
+export function isDatabaseError(error: unknown): boolean {
+  return someNode(error, ownDatabaseError)
 }
 
 /**
@@ -63,20 +95,18 @@ export function isDatabaseError(error: unknown, depth = 0): boolean {
  * a message, so this is the last line of defense. The list is short on purpose: ordinary refusal text such as "Use a
  * replica set" or "You are not allowed to perform this action" must not match.
  */
-const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|\btransactions?\b[^.\n]{0,60}\bhas been aborted|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bsession\b[^.\n]{0,60}\bwas killed|\bwrite conflict\b/i
+const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|\btransactions?\b[^.\n]{0,60}\bhas been aborted|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bsession\b[^.\n]{0,60}\bwas killed|\bwrite conflict\b|Cannot start transaction[^.\n]{0,120}\bnewer transaction\b|\bnewer transaction\b[^.\n]{0,60}\balready started|No transaction started|Transaction[^.\n]{0,40}already in progress|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction/i
 /** Whether a message reads like the database's own session or transaction failure (see `DATABASE_MESSAGE`). */
 export function isDatabaseErrorMessage(message: string): boolean {
   return DATABASE_MESSAGE.test(message)
 }
-/** Whether the error's message, or the message of anything nested in `cause`, `errorResponse` or `errors` (bounded depth), is the database's own. */
-function databaseMessageIn(error: unknown, depth = 0): boolean {
-  if (error === null || error === undefined || depth > 6) return false
-  if (typeof error === 'string') return isDatabaseErrorMessage(error)
-  if (typeof error !== 'object') return false
-  const e = error as { message?: unknown; errmsg?: unknown; errorResponse?: unknown }
-  if (isDatabaseErrorMessage(messageOf(error)) || (typeof e.errmsg === 'string' && isDatabaseErrorMessage(e.errmsg))) return true
-  if (databaseMessageIn(e.errorResponse, depth + 1)) return true
-  return causesOf(error).some((c) => databaseMessageIn(c, depth + 1))
+/** Whether the error's message, or the message of anything nested in `cause`, `errorResponse` or `errors` (bounded depth, each object once), is the database's own. */
+function databaseMessageIn(error: unknown): boolean {
+  return someNode(error, (node) => {
+    if (typeof node === 'string') return isDatabaseErrorMessage(node)
+    const e = node as { errmsg?: unknown }
+    return isDatabaseErrorMessage(messageOf(node)) || (typeof e.errmsg === 'string' && isDatabaseErrorMessage(e.errmsg))
+  })
 }
 
 /**
@@ -286,7 +316,10 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 // 2. Settings that look on but aren't: transactions
 // ---------------------------------------------------------------------------------------------------------
 
-const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.test(said) && !isDatabaseErrorMessage(said) && !isValidationError(error)
+/** Words a plugin uses when it says no on purpose, as opposed to a transaction fault that merely mentions the word. */
+const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't|cannot|can't|unable|not (?:available|enabled|supported|allowed)|disabled|turned off|(?:is|are) off|switched off|without|replica set)\b/i
+/** By default a refusal mentions transactions and says no on purpose. The word alone is not enough: "Transaction failed" is a fault. */
+const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said) && !isValidationError(error)
 
 /**
  * A plugin that relies on transactions must refuse to run without them. Payload starts without transactions
@@ -300,8 +333,8 @@ const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.tes
  *   for the writes only. A guard that checks transactions once at start-up passes start-up and is caught here,
  *   as is a guard that reads `req.transactionID` without awaiting it.
  *
- * `refusal` says what a proper refusal looks like; by default an error that mentions transactions but isn't
- * one of the database's own. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
+ * `refusal` says what a proper refusal looks like; by default an error that mentions transactions and says no on purpose
+ * (needs, requires, must, refuses, cannot, without, off, replica set), but isn't one of the database's own. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
  * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, and by Mongo's
  * own message words (also in a nested `cause` or `errorResponse`) when a wrapper kept only the text, and a database error is never a refusal, whatever `refusal` matches. A validation error is
  * not one by default. Any other error is "not checked".

@@ -709,3 +709,78 @@ describe('review round 5: real driver wording, and database messages nested in a
     expect(isRefusal(deep)).toBe(true)
   })
 })
+
+describe('review round 6: more driver wording, a stricter default refusal, cycles, errorResponse', () => {
+  const driverText = [
+    'Cannot start transaction 5 on session 1a2b because a newer transaction 6 has already started.',
+    'No transaction started',
+    'Transaction already in progress',
+    'Cannot call commitTransaction after calling abortTransaction',
+    'Cannot call abortTransaction after calling commitTransaction',
+  ]
+  const runDefault = (said: string, mode: 'start' | 'write') =>
+    runTransactionCheck({
+      start: mode === 'start' ? async () => { throw new Error(said) } : async () => ({ payload: await boot('r6-default', false) }),
+      write: async () => { throw new Error(said) },
+    })
+
+  it('real driver wording is a database message', () => {
+    for (const m of driverText) expect(isDatabaseErrorMessage(m), m).toBe(true)
+  })
+  it('code 225 and codeName TransactionTooOld are transaction errors, also in errorResponse', () => {
+    const tooOld = Object.assign(new Error('x'), { name: 'MongoServerError', code: 225, codeName: 'TransactionTooOld' })
+    expect(isTransactionError(tooOld)).toBe(true)
+    expect(isTransactionError(Object.assign(new Error('x'), { errorResponse: { code: 225, codeName: 'TransactionTooOld', errmsg: 'plain' } }))).toBe(true)
+  })
+  it('the default rule no longer accepts driver transaction faults as a clean refusal', async () => {
+    for (const said of [...driverText, 'Transaction failed', 'Transaction 7 could not be completed']) {
+      for (const mode of ['start', 'write'] as const) {
+        const [f] = await runDefault(said, mode)
+        expect(f!.status, `${mode}: ${said}`).toBe('not-checked')
+      }
+    }
+  })
+  it('plugin refusal messages that mention transactions still pass by default', async () => {
+    for (const said of ['This plugin needs database transactions, and they are off.', 'Transactions are required. Use a replica set.', 'Unknown status.', 'You can’t accept this offer.']) {
+      const [f] = await runDefault(said, 'start')
+      // Only messages that mention transactions can be a default refusal here.
+      expect(f!.status, said).toBe(/transaction/i.test(said) ? 'pass' : 'not-checked')
+    }
+    expect(isRefusal(Object.assign(new Error('Unknown status.'), { status: 403 }))).toBe(true)
+    expect(isRefusal(Object.assign(new Error('You can’t accept this offer.'), { status: 403 }))).toBe(true)
+  })
+  it('a self-referential errors array finishes quickly', () => {
+    const e = Object.assign(new Error('loop'), { errors: [] as unknown[] })
+    for (let i = 0; i < 8; i++) e.errors.push(e)
+    const started = Date.now()
+    expect(isDatabaseError(e)).toBe(false)
+    expect(isTransactionError(e)).toBe(false)
+    expect(isRefusal(e)).toBe(false)
+    const a = Object.assign(new Error('a'), { status: 403, errors: [] as unknown[] })
+    const b = Object.assign(new Error('b'), { errors: [a, a, a, a, a, a] })
+    for (let i = 0; i < 8; i++) a.errors.push(a, b)
+    expect(isRefusal(a)).toBe(true)
+    expect(Date.now() - started).toBeLessThan(2000)
+    // A database error hiding behind a cycle is still found.
+    e.errors.push(Object.assign(new Error('y'), { codeName: 'WriteConflict' }))
+    expect(isDatabaseError(e)).toBe(true)
+  })
+  it('errorResponse codeName and errorLabels are read', () => {
+    const named = Object.assign(new Error('Could not save'), { status: 403, errorResponse: { codeName: 'SomeServerThing' } })
+    const labelled = Object.assign(new Error('Could not save'), { status: 403, errorResponse: { errorLabels: ['TransientTransactionError'] } })
+    expect(isDatabaseError(named)).toBe(true)
+    expect(isRefusal(named)).toBe(false)
+    expect(isTransactionError(labelled)).toBe(true)
+    expect(isRefusal(labelled)).toBe(false)
+  })
+})
+
+describe('interface strings', () => {
+  it('no button label ends with a period (an ellipsis is fine)', async () => {
+    const { readFileSync } = await import('node:fs')
+    const src = readFileSync(new URL('../src/client/RetestSelected.tsx', import.meta.url), 'utf8')
+    const labels = [...src.matchAll(/<button\b[^>]*>([\s\S]*?)<\/button>/g)].flatMap((m) => [...m[1]!.matchAll(/'([^']*)'|`([^`]*)`/g)].map((s) => s[1] ?? s[2]!))
+    expect(labels.length).toBeGreaterThan(0)
+    for (const l of labels) expect(/\.\s*$/.test(l.replace(/\$\{[^}]*\}/g, 'x')) && !/…\s*$/.test(l), l).toBe(false)
+  })
+})

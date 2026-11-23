@@ -2,6 +2,13 @@
 
 Newest first.
 
+## 2026-11-23 (round 6): driver wording, strict default refusal, cycles
+
+Suite: 109 tests before, 116 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
+
+- **Covered.** TransactionTooOld wording, "No transaction started", "Transaction already in progress" and the commit/abort order errors are database messages; code 225 and TransactionTooOld in `errorResponse` count; the default refusal in both modes no longer passes those or "Transaction failed"; plugin refusals ("needs database transactions, and they are off", "Use a replica set", 403 "Unknown status.") still pass; a self-referential `errors` array (and a shared-node graph) finishes fast and a database error behind a cycle is still found; `errorResponse` `codeName` and `errorLabels` are read; the button label has no trailing period. Five of the seven new cases fail on the old code (the cycle case does not finish there); the other two guard ordinary refusals and the label.
+- **Skipped.** A real double commit or old transaction on a live server (not triggerable on demand).
+
 ## 2026-11-23 (round 5): one list of driver words, and nested messages
 
 Suite: 103 tests before, 109 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
