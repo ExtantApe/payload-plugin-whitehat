@@ -53,8 +53,38 @@ function balanced(src: string, open: number): string {
   return src.slice(open)
 }
 
-export function lintSource(path: string, source: string): Finding[] {
+/** Local constant objects (`const READ = { pagination: false }`), by name, so a spread can be followed. */
+export function collectObjects(src: string): Map<string, string> {
+  const map = new Map<string, string>()
+  for (const m of src.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*(?=\{)/g)) map.set(m[1]!, balanced(src, m.index! + m[0].length))
+  return map
+}
+
+/** Whether the call, or an object spread into it, sets `pagination: false`. */
+function paginationOff(text: string, objects: Map<string, string>, seen = new Set<string>()): boolean {
+  if (/pagination\s*:\s*false/.test(text)) return true
+  for (const m of text.matchAll(/\.\.\.\s*([A-Za-z_$][\w$]*)\b(?!\s*[.(\[])/g)) {
+    const name = m[1]!
+    if (seen.has(name)) continue
+    seen.add(name)
+    const body = objects.get(name)
+    if (body && paginationOff(body, objects, seen)) return true
+  }
+  return false
+}
+
+/** Whether a Payload call that carries `req` comes before `end` in the function. An Array `.find` doesn't carry it. */
+function earlierQuery(src: string, start: number, end: number): boolean {
+  const before = src.slice(start, end)
+  for (const m of before.matchAll(/\.(?:find|findByID|findOne|count|create|update|delete|findGlobal|updateGlobal)\s*\(/g)) {
+    if (/\breq\b/.test(balanced(src, start + m.index! + m[0].length - 1))) return true
+  }
+  return false
+}
+
+export function lintSource(path: string, source: string, shared: Map<string, string> = new Map()): Finding[] {
   const src = stripComments(source)
+  const objects = new Map([...shared, ...collectObjects(src)])
   const out: Finding[] = []
   const add = (check: string, title: string, index: number, how: string) =>
     out.push({ check, title, severity: 'medium', status: 'fail', role: 'code', path: `${path}:${lineOf(src, index)}`, how, reproduce: `Open ${path} at line ${lineOf(src, index)}.` })
@@ -85,8 +115,8 @@ export function lintSource(path: string, source: string): Finding[] {
   for (const m of src.matchAll(/\.find\s*\(/g)) {
     const call = balanced(src, m.index! + m[0].length - 1)
     if (!/\breq\b/.test(call)) continue
-    if (/pagination\s*:\s*false/.test(call)) continue
-    if (/\.(?:find|findByID|findOne|count|create|update|delete|findGlobal|updateGlobal)\s*\(/.test(src.slice(enclosingStart(src, m.index!), m.index!))) continue
+    if (paginationOff(call, objects)) continue
+    if (earlierQuery(src, enclosingStart(src, m.index!), m.index!)) continue
     add('paginated-find-in-transaction', 'A paginated find with req may be a transaction’s first query', m.index!, 'payload.find runs its query and its count at once; as the first query on a transaction’s one Mongo session that throws NoSuchTransaction. Add pagination: false, or use a single query. (Heuristic: it can’t see whether a transaction is open, or what called this function.)')
   }
   return out
@@ -104,6 +134,12 @@ export function lintDirectory(dir: string): Finding[] {
     }
   }
   walk(dir)
-  const found = files.flatMap((f) => lintSource(relative(dir, f), readFileSync(f, 'utf8')))
-  return found.length ? found : [{ check: 'plugin-source-lint', title: 'Plugin source lint', severity: 'info', status: 'pass', role: 'code', path: dir, how: `Read ${files.length} file${files.length === 1 ? '' : 's'}; nothing to flag.` }]
+  const texts = files.map((f) => [f, readFileSync(f, 'utf8')] as const)
+  // A constant imported from another file is followed only when its name is used once across the folder.
+  const counts = new Map<string, number>()
+  const shared = new Map<string, string>()
+  for (const [, t] of texts) for (const [k, v] of collectObjects(stripComments(t))) (counts.set(k, (counts.get(k) ?? 0) + 1), shared.set(k, v))
+  for (const [k, n] of counts) if (n > 1) shared.delete(k)
+  const found = texts.flatMap(([f, t]) => lintSource(relative(dir, f), t, shared))
+  return found.length ? found : [{ check: 'plugin-source-lint', title: 'Plugin source lint', severity: 'info', status: 'pass', role: 'code', path: '.', how: `Read ${files.length} file${files.length === 1 ? '' : 's'}; nothing to flag.` }]
 }

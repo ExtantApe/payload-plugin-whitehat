@@ -34,7 +34,7 @@ Two modes. In the default `off-at-start` mode, `start` boots the instance with t
 
 A start-up check can't see a per-request guard. With `mode: 'null-after-start'`, `start` boots a normal instance and the check makes `beginTransaction` answer null for the write only (and puts it back afterwards). A plugin that checked once at start-up, or that reads `req.transactionID` without awaiting it, passes start-up and fails here. Run both modes.
 
-A refusal is an error that mentions transactions, or whatever `refusal` matches (a pattern or a function of the message). Mongo's own NoSuchTransaction and "Transaction numbers are only allowed on a replica set member" are not refusals. Any other error, transactions that turn out to be on, or a `beginTransaction` that throws, is `not-checked`.
+A refusal is an error that mentions transactions, or whatever `refusal` matches (a pattern or a function of the message). Mongo's own NoSuchTransaction and "Transaction numbers are only allowed on a replica set member" are not refusals. The plugin's own advice, such as "Use a replica set", is. Any other error, transactions that turn out to be on, or a `beginTransaction` that throws, is `not-checked`.
 
 ## 3. `runServerBackDoorCheck`
 
@@ -42,7 +42,7 @@ For each protected collection (`slug`, the `identity` that must be refused, a `p
 
 ## 4. `runHostRuleCheck`
 
-For each host access or veto option: `install(answer)` sets the host's answer (`HOST_ANSWERS`: `true`, `{}`, null, 0, an empty string, a throw, a narrow where, 1, `'yes'`, `[]`, false, undefined and a function), and `attempt` does something the plugin's default refuses. With no host answer the attempt must be refused (otherwise `not-checked`). After that only answers in `mayWiden` (default `['true']`) may turn it into an allow. Everything else must keep the default. `install(undefined)` runs first and last, so the option is put back.
+For each host access or veto option: `install(answer)` sets the host's answer (`HOST_ANSWERS`: `true`, `{}`, null, 0, an empty string, a throw, a narrow where, 1, `'yes'`, `[]`, false, undefined and a function), and `attempt` does something the plugin's default refuses. With no host answer the attempt must be refused (otherwise `not-checked`). After that only answers in `mayWiden` (default `['true']`) may turn it into an allow. Everything else, a function included, must keep the default. A `veto` option must refuse on `true`, on a reason string (`'yes'`) and on a throw. `install(undefined)` runs first and last, so the option is put back.
 
 For a veto hook, set `kind: 'veto'`. Null means go ahead there, so the rule is different: `attempt` is something the default allows, an exact `true` must refuse it, and so must a throw (a broken veto fails closed). The other answers may allow or refuse, since they aren't vetoes; only a crash is flagged.
 

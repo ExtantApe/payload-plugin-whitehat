@@ -19,6 +19,8 @@ export const state = {
   txHole: false,
   /** A veto answer counts when merely truthy, and a thrown veto means go ahead. */
   looseVeto: false,
+  /** A veto that only refuses on an exact true, and ignores a reason string. */
+  trueOnlyVeto: false,
   /** Every guarded write dies with a database error, as a transaction failure would. */
   crash: false,
   /** Host hooks. */
@@ -97,7 +99,7 @@ const invites: CollectionConfig = {
         let vetoed = false
         try {
           const answer = await state.host.vetoInvite?.(target)
-          vetoed = state.looseVeto ? Boolean(answer) : answer === true
+          vetoed = state.looseVeto ? Boolean(answer) : answer === true || (!state.trueOnlyVeto && typeof answer === 'string' && answer !== '')
         } catch {
           vetoed = !state.looseVeto
         }

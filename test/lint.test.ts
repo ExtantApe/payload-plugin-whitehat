@@ -59,4 +59,28 @@ describe('5. static lint', () => {
     writeFileSync(join(dir, 'src', 'a.ts'), 'if ((await options.canInvite(req)) === true) return\n')
     expect(lintDirectory(dir)).toMatchObject([{ status: 'pass', severity: 'info' }])
   })
+  it('D: an Array find earlier in the function is not a Payload query', () => {
+    const src = "export const h = async ({ req }) => {\n  const t = types.find((x) => x.id === 1)\n  await req.payload.find({ collection: 'x', req })\n}"
+    expect(hits(src)).toEqual(['paginated-find-in-transaction hook.ts:3'])
+    const q = "export const h = async ({ req }) => {\n  await req.payload.find({ collection: 'a', pagination: false, req })\n  await req.payload.find({ collection: 'x', req })\n}"
+    expect(hits(q)).toEqual([])
+  })
+  it('E: follows spreads of local constant objects, including nested ones', () => {
+    const src = "const READ = { pagination: false }\nconst list = { ...READ, depth: 0 }\nexport const h = async ({ req }) => {\n  await req.payload.find({ collection: 'x', ...list, req })\n}"
+    expect(hits(src)).toEqual([])
+    expect(hits("const other = { depth: 0 }\nexport const h = async ({ req }) => {\n  await req.payload.find({ collection: 'x', ...other, req })\n}")).toEqual(['paginated-find-in-transaction hook.ts:3'])
+  })
+  it('E: follows a spread of a constant defined in another file of the folder', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'whitehat-lint-'))
+    dirs.push(dir)
+    writeFileSync(join(dir, 'consts.ts'), 'export const READ = { pagination: false }\n')
+    writeFileSync(join(dir, 'h.ts'), "export const h = async ({ req }) => {\n  await req.payload.find({ collection: 'x', ...READ, req })\n}\n")
+    expect(lintDirectory(dir)).toMatchObject([{ status: 'pass' }])
+  })
+  it('low: the pass finding has a relative path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'whitehat-lint-'))
+    dirs.push(dir)
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 1\n')
+    expect(lintDirectory(dir)[0]!.path).toBe('.')
+  })
 })

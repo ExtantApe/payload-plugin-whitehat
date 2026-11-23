@@ -33,7 +33,7 @@ const messageOf = (e: unknown): string => {
   let data = ''
   try {
     const d = (e as { data?: unknown })?.data
-    data = d === undefined ? '' : JSON.stringify(d)
+    data = d === undefined || d === null ? '' : JSON.stringify(d)
   } catch {
     data = ''
   }
@@ -78,9 +78,18 @@ function shapeOf(v: unknown, depth = 0): string {
   return typeof v
 }
 
+/** Key order carries no meaning, so objects are written with their keys sorted. */
+const sortKeys = (v: unknown, depth = 0): unknown => {
+  if (depth > 20 || v === null || typeof v !== 'object') return v
+  if (Array.isArray(v)) return v.map((x) => sortKeys(x, depth + 1))
+  const o = v as Record<string, unknown>
+  const toJSON = (o as { toJSON?: unknown }).toJSON
+  if (typeof toJSON === 'function') return v
+  return Object.fromEntries(Object.keys(o).sort().map((k) => [k, sortKeys(o[k], depth + 1)]))
+}
 const json = (v: unknown): string => {
   try {
-    return JSON.stringify(v) ?? 'undefined'
+    return JSON.stringify(sortKeys(v)) ?? 'undefined'
   } catch {
     return '[unserializable]'
   }
@@ -115,6 +124,8 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
     const id = own(v)
     if (id.length >= 3) t = t.split(id).join('<id>')
     t = t.replace(IDS, '<x>')
+    // A short id would also match inside other words and numbers, so it only counts as a whole token.
+    if (id.length > 0 && id.length < 3) t = t.replace(new RegExp(`(?<![\\w-])${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`, 'g'), '<id>')
     return input.mask ? input.mask(t) : t
   }
   for (const op of input.operations) {
@@ -154,6 +165,20 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
     }
     const [x, y] = outcomes as [Outcome, Outcome]
     const crashed = [x, y].find((o) => o.threw && !o.refused)
+    const other = crashed === x ? y : x
+    if (crashed && !other.threw) {
+      out.push({
+        check: 'response-difference',
+        title,
+        severity,
+        status: 'fail',
+        role: pair,
+        path: op.id,
+        how: `One identity was allowed and the other got an error that isn’t a refusal (${clip(crashed.message, 80)}). A caller can see that difference.`,
+        reproduce: op.reproduce ?? 'Run the operation once as each identity and compare the two answers.',
+      })
+      continue
+    }
     if (crashed) {
       out.push(note('response-difference', title, pair, `An answer was an error that isn’t a refusal (${clip(crashed.message, 80)}), so it says nothing about access.`, op.id, severity))
       continue
@@ -184,7 +209,7 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 // ---------------------------------------------------------------------------------------------------------
 
 /** Mongo's own complaints about transactions are not the plugin refusing. */
-const DEFAULT_TX_REFUSAL = (said: string) => /transaction/i.test(said) && !/NoSuchTransaction|Transaction numbers are only allowed|replica set|TransientTransactionError|WriteConflict/i.test(said)
+const DEFAULT_TX_REFUSAL = (said: string) => /transaction/i.test(said) && !/NoSuchTransaction|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|TransientTransactionError|WriteConflict/i.test(said)
 
 /**
  * A plugin that relies on transactions must refuse to run without them. Payload starts without transactions
@@ -282,9 +307,6 @@ export type ProtectedCollection = {
   seed: () => Promise<void>
 }
 
-/** Mongo's own failures that a bulk operation reports in `errors` instead of throwing. */
-const INFRA = /transaction|mongo|econn|timed? ?out|socket|topology/i
-
 /**
  * For each protected collection: bulk update and bulk delete with a `where`, update, delete and (with `create`)
  * create with `disableTransaction: true`, and, when `holdsForServerCode`, the same with `overrideAccess: true`
@@ -292,8 +314,8 @@ const INFRA = /transaction|mongo|econn|timed? ?out|socket|topology/i
  * `{ docs, errors }` instead of throwing, so a rule that only guards single writes, or that commits one document
  * at a time, lets them through.
  *
- * Only a recognized refusal passes (see `isRefusal`). Any other error, and bulk errors that name the database,
- * are "not-checked".
+ * Only a recognized refusal passes (see `isRefusal`). Any other error, and any bulk error entry that isn't a
+ * recognized refusal (a TypeError reported in `errors`, a database failure), are "not-checked".
  */
 export async function runServerBackDoorCheck(payload: Payload, collections: ProtectedCollection[], options: { isRefusal?: (error: unknown) => boolean } = {}): Promise<Finding[]> {
   const out: Finding[] = []
@@ -306,8 +328,9 @@ export async function runServerBackDoorCheck(payload: Payload, collections: Prot
     const bulk = (r: unknown): boolean => {
       const res = r as Result
       if ((res.docs?.length ?? 0) > 0) return true
-      const infra = res.errors?.find((e) => INFRA.test(String(e.message)))
-      if (infra) throw Object.assign(new Error(`bulk operation error: ${clip(String(infra.message), 80)}`), { crash: true })
+      // Any error in the list that isn't a recognized refusal says nothing about access, so it is "not-checked".
+      const other = res.errors?.find((e) => !refusal(e) && !/not allowed to perform|forbidden/i.test(String(e?.message)))
+      if (other) throw Object.assign(new Error(`bulk operation error: ${clip(messageOf(other), 80)}`), { crash: true })
       return false
     }
     const probes: { id: string; title: string; run: (id: string | number) => Promise<boolean>; delete?: boolean }[] = [
@@ -397,7 +420,7 @@ export type HostRuleOption = {
    * `access` (default): the option can widen what the plugin allows. The attempt is something the default
    * refuses, and only the answers in `mayWiden` may change that.
    * `veto`: the option can refuse something the plugin allows. The attempt is something the default allows.
-   * An exact `true` must refuse it, and so must a throw (a broken veto fails closed). The other answers
+   * An exact `true` must refuse it, and so must a reason string (`'yes'`) and a throw (a broken veto fails closed). The other answers
    * (null, 0, an empty string, false, undefined and so on) mean go ahead or are the plugin's choice, so any
    * allow or refusal is accepted for them; only a crash is flagged.
    */
@@ -422,7 +445,7 @@ export type HostRuleOption = {
 /**
  * Feeds each kind of host answer into a host-supplied rule and checks the plugin's defaults still hold. The
  * default outcome is measured first (`install(undefined)`). For `access` options, only the answers in `mayWiden`
- * may turn a refusal into an allow; for `veto` options, `true` and a throw must refuse. An error that isn't a
+ * may turn a refusal into an allow; for `veto` options, `true`, a reason string and a throw must refuse. An error that isn't a
  * recognized refusal (see `isRefusal`) is "not-checked", never a refusal.
  */
 export async function runHostRuleCheck(options: HostRuleOption[]): Promise<Finding[]> {
@@ -466,7 +489,7 @@ export async function runHostRuleCheck(options: HostRuleOption[]): Promise<Findi
         let wrong: boolean
         let how: string
         if (veto) {
-          const mustRefuse = answer.name === 'true' || answer.name === 'throw'
+          const mustRefuse = answer.name === 'true' || answer.name === 'yes-string' || answer.name === 'throw'
           wrong = mustRefuse && result === 'allowed'
           how = wrong ? `A veto answer of ${answer.name} didn’t stop the operation.` : mustRefuse ? 'The veto applied.' : `${answer.name} isn’t a veto; the operation was ${result}.`
         } else {

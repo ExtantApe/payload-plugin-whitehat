@@ -32,7 +32,7 @@ const boot = async (key: string, transactions: boolean) => {
   return p
 }
 const reset = () => {
-  state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = state.looseVeto = state.crash = false
+  state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = state.looseVeto = state.trueOnlyVeto = state.crash = false
   state.host = {}
   state.transactions = 'ignored'
 }
@@ -314,6 +314,10 @@ describe('4. host rules that replace defaults', () => {
       expect(bad(out)).toEqual([])
       expect(out.find((f) => f.path!.endsWith('null'))!.how).toMatch(/isn’t a veto/)
     })
+    it('fires when a veto refuses only on true and lets a reason string through', async () => {
+      state.trueOnlyVeto = true
+      expect(names(await runHostRuleCheck([veto()]))).toEqual(['yes-string'])
+    })
     it('fires when a thrown veto lets the operation through', async () => {
       state.looseVeto = true
       expect(names(await runHostRuleCheck([veto()]))).toEqual(['throw'])
@@ -326,5 +330,64 @@ describe('4. host rules that replace defaults', () => {
     state.host = {}
     await runHostRuleCheck([option()])
     expect(state.host.allowClosed).toBeUndefined()
+  })
+})
+
+describe('review round 2', () => {
+  const fakeBulk = (errors: { message: string }[], docs: unknown[] = []) =>
+    ({
+      find: async () => ({ docs: [{ id: 'row1' }] }),
+      update: async (a: { where?: unknown }) => (a.where ? { docs, errors } : Object.assign(Promise.reject(Object.assign(new Error('No'), { status: 403 })))),
+      delete: async (a: { where?: unknown }) => (a.where ? { docs, errors } : Promise.reject(Object.assign(new Error('No'), { status: 403 }))),
+      create: async () => Promise.reject(Object.assign(new Error('No'), { status: 403 })),
+    }) as unknown as Payload
+  const col = [{ slug: 'notes', identity: { role: 'owner', user: { id: 'u1' } } as unknown as Viewer, protectedWhere: {}, data: {}, holdsForServerCode: true, seed: async () => undefined }]
+  const bulkOf = (fs: Finding[]) => fs.filter((f) => f.path!.includes('bulk')).map((f) => f.status)
+
+  it('A: a TypeError in a bulk errors list is not-checked, and a real refusal there passes', async () => {
+    expect(bulkOf(await runServerBackDoorCheck(fakeBulk([{ message: "Cannot read properties of undefined (reading 'id')" }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+    expect(bulkOf(await runServerBackDoorCheck(fakeBulk([{ message: 'You are not allowed to perform this action.' }]), col))).toEqual(['pass', 'pass', 'pass', 'pass'])
+  })
+  it('B: a veto that refuses only on true fails for a reason string', async () => {
+    const calls: string[] = []
+    let answer: HostAnswer | undefined
+    const out = await runHostRuleCheck([
+      {
+        id: 'v',
+        kind: 'veto',
+        install: (a) => void (answer = a),
+        attempt: async () => {
+          calls.push('x')
+          if (answer?.value === true) throw Object.assign(new Error('No'), { status: 403 })
+        },
+      },
+    ])
+    expect(out.filter((f) => f.status === 'fail').map((f) => f.path)).toEqual(['v · throw', 'v · yes-string'])
+  })
+  it('C: the plugin’s own “Use a replica set” advice is a refusal, Mongo’s own message is not', async () => {
+    const run = (said: string) => runTransactionCheck({ start: async () => { throw new Error(said) }, write: async () => undefined })
+    expect((await run('This plugin needs transactions. Use a replica set.'))[0]).toMatchObject({ status: 'pass' })
+    expect((await run('Transaction numbers are only allowed on a replica set member or mongos'))[0]).toMatchObject({ status: 'not-checked' })
+  })
+  it('F: one identity allowed and the other got a 500 is a finding', async () => {
+    const [f] = await runResponseDifferenceProbe({
+      identities: [minor, closed],
+      operations: [{ id: 'five', title: 'f', run: async (who: Viewer) => { if (who.role === 'minor') return { ok: true }; throw Object.assign(new Error('boom'), { status: 500 }) } }],
+    })
+    expect(f).toMatchObject({ status: 'fail' })
+    const [g] = await runResponseDifferenceProbe({
+      identities: [minor, closed],
+      operations: [{ id: 'both', title: 'f', run: async () => { throw Object.assign(new Error('boom'), { status: 500 }) } }],
+    })
+    expect(g).toMatchObject({ status: 'not-checked' })
+  })
+  it('low: short ids are masked, reordered keys are equal, and a null data does not append null', async () => {
+    const mk = (id: string): Viewer => ({ role: id === '1' ? 'minor' : 'closed', user: { id } as never }) as Viewer
+    const [short] = await runResponseDifferenceProbe({ identities: [mk('1'), mk('2')], operations: [{ id: 's', title: 's', run: async (w: Viewer) => ({ who: (w.user as { id: string }).id }) }] })
+    expect(short).toMatchObject({ status: 'pass' })
+    const [order] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'o', title: 'o', run: async (w: Viewer) => (w.role === 'minor' ? { a: 1, b: { c: 2, d: 3 } } : { b: { d: 3, c: 2 }, a: 1 }) }] })
+    expect(order).toMatchObject({ status: 'pass' })
+    const [nul] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'n', title: 'n', run: async (w: Viewer) => { throw Object.assign(new Error('Nope'), { status: 403, data: w.role === 'minor' ? null : undefined }) } }] })
+    expect(nul).toMatchObject({ status: 'pass' })
   })
 })
