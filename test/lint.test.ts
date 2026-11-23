@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
@@ -76,6 +76,16 @@ describe('5. static lint', () => {
     writeFileSync(join(dir, 'consts.ts'), 'export const READ = { pagination: false }\n')
     writeFileSync(join(dir, 'h.ts'), "export const h = async ({ req }) => {\n  await req.payload.find({ collection: 'x', ...READ, req })\n}\n")
     expect(lintDirectory(dir)).toMatchObject([{ status: 'pass' }])
+  })
+  it('low: symbolic links are never followed', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'whitehat-lint-out-'))
+    const dir = mkdtempSync(join(tmpdir(), 'whitehat-lint-'))
+    dirs.push(outside, dir)
+    writeFileSync(join(outside, 'x.ts'), 'if (await options.canInvite(req)) return\n')
+    writeFileSync(join(dir, 'a.ts'), 'export const a = 1\n')
+    symlinkSync(outside, join(dir, 'linked'))
+    symlinkSync(join(outside, 'x.ts'), join(dir, 'file-link.ts'))
+    expect(lintDirectory(dir)).toMatchObject([{ status: 'pass', how: expect.stringMatching(/Read 1 file;/) }])
   })
   it('low: the pass finding has a relative path', () => {
     const dir = mkdtempSync(join(tmpdir(), 'whitehat-lint-'))

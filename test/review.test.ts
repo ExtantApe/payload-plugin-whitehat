@@ -1,10 +1,12 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
+import { MongoClient } from 'mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { BasePayload, buildConfig, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { HOST_ANSWERS, isRefusal, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
+import { HOST_ANSWERS, isDatabaseError, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
 import { fixturePlugin, state } from './fixtures/fixturePlugin.js'
+import { closeAll } from './helpers/mongo.js'
 
 /** Real Payload 3.x on in-memory MongoDB, a made-up plugin, made-up users. Every instance and the database are removed at the end. */
 let mongo: MongoMemoryReplSet
@@ -25,14 +27,14 @@ const boot = async (key: string, transactions: boolean) => {
   try {
     await p.init({ config: await config(key, transactions) })
   } catch (e) {
-    await p.destroy()
+    await p.destroy().catch(() => undefined)
     throw e
   }
   booted.push(p)
   return p
 }
 const reset = () => {
-  state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = state.looseVeto = state.trueOnlyVeto = state.crash = false
+  state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = state.looseVeto = state.trueOnlyVeto = state.silentLock = state.crash = false
   state.host = {}
   state.transactions = 'ignored'
 }
@@ -56,8 +58,7 @@ beforeAll(async () => {
   owner = await user('owner')
 })
 afterAll(async () => {
-  for (const p of booted) await p.destroy()
-  await mongo?.stop()
+  expect(await closeAll(booted, mongo)).toEqual([])
 })
 beforeEach(reset)
 
@@ -73,7 +74,7 @@ describe('1. response-difference probe', () => {
   // The first identity is refused by the host's veto, the second simply isn't allowed.
   const run = () => runResponseDifferenceProbe({ identities: [minor, closed], operations: ops() })
   const withVeto = () => {
-    state.host.vetoInvite = async (id) => id === minor.id
+    state.host.vetoInvite = async (id) => (id === minor.id ? true : null)
   }
 
   it('stays quiet when both identities get the same refusal and leave the same trace', async () => {
@@ -106,7 +107,7 @@ describe('1. response-difference probe', () => {
     const got = await runResponseDifferenceProbe({
       identities: [minor, closed],
       operations: [
-        { id: 'status', title: 's', run: bySide(err(403), err(400)) },
+        { id: 'status', title: 's', run: bySide(err(403), err(401)) },
         { id: 'shape', title: 'h', run: bySide({ id: 'x', docs: [] }, { id: 'x' }) },
         { id: 'allowed', title: 'a', run: bySide({ ok: true }, err(403)) },
         { id: 'same', title: 'same', run: bySide(err(403), err(403)) },
@@ -309,18 +310,28 @@ describe('4. host rules that replace defaults', () => {
       attempt: () => payload.create({ collection: 'invites' as never, data: { target: owner.id } as never, user: actor.user as never, overrideAccess: false }),
       restore: async () => void (await payload.delete({ collection: 'invites' as never, where: { id: { exists: true } } as never, overrideAccess: true })),
     })
-    it('stays quiet when an exact true and a throw veto, and null, 0 and the rest go ahead', async () => {
+    it('stays quiet when only null and undefined go ahead and every other answer vetoes', async () => {
       const out = await runHostRuleCheck([veto()])
+      expect(out).toHaveLength(HOST_ANSWERS.length)
       expect(bad(out)).toEqual([])
-      expect(out.find((f) => f.path!.endsWith('null'))!.how).toMatch(/isn’t a veto/)
+      expect(out.find((f) => f.path!.endsWith('null'))!.how).toMatch(/go ahead/)
+      expect(out.find((f) => f.path!.endsWith('false'))!.how).toMatch(/veto applied/)
     })
-    it('fires when a veto refuses only on true and lets a reason string through', async () => {
+    it('fires for each answer a veto lets through, one test per answer', async () => {
       state.trueOnlyVeto = true
-      expect(names(await runHostRuleCheck([veto()]))).toEqual(['yes-string'])
+      // Only an exact true vetoes in this variant, so every other answer that must refuse is a finding. A throw vetoes here.
+      const expected = ['empty-object', 'zero', 'empty-string', 'where', 'one', 'yes-string', 'empty-array', 'false', 'function']
+      expect(names(await runHostRuleCheck([veto()]))).toEqual(expected)
     })
-    it('fires when a thrown veto lets the operation through', async () => {
+    it('fires when a falsy answer or a thrown veto lets the operation through', async () => {
       state.looseVeto = true
-      expect(names(await runHostRuleCheck([veto()]))).toEqual(['throw'])
+      expect(names(await runHostRuleCheck([veto()]))).toEqual(['zero', 'empty-string', 'throw', 'false'])
+    })
+    it('lets a plugin that documents another go-ahead answer say so, and says it', async () => {
+      state.looseVeto = true
+      const out = await runHostRuleCheck([{ ...veto(), goAhead: ['null', 'undefined', 'false', 'zero', 'empty-string'] }])
+      expect(names(out)).toEqual(['throw'])
+      expect(out.find((f) => f.path!.endsWith('false'))!.how).toMatch(/documented as go ahead/)
     })
   })
   it('is not-checked when the default doesn’t restrict anything, and puts the host option back', async () => {
@@ -337,6 +348,7 @@ describe('review round 2', () => {
   const fakeBulk = (errors: { message: string }[], docs: unknown[] = []) =>
     ({
       find: async () => ({ docs: [{ id: 'row1' }] }),
+      findByID: async () => ({ id: 'row1' }),
       update: async (a: { where?: unknown }) => (a.where ? { docs, errors } : Object.assign(Promise.reject(Object.assign(new Error('No'), { status: 403 })))),
       delete: async (a: { where?: unknown }) => (a.where ? { docs, errors } : Promise.reject(Object.assign(new Error('No'), { status: 403 }))),
       create: async () => Promise.reject(Object.assign(new Error('No'), { status: 403 })),
@@ -362,7 +374,7 @@ describe('review round 2', () => {
         },
       },
     ])
-    expect(out.filter((f) => f.status === 'fail').map((f) => f.path)).toEqual(['v · throw', 'v · yes-string'])
+    expect(out.filter((f) => f.status === 'fail').map((f) => f.path)).toEqual(['v · empty-object', 'v · zero', 'v · empty-string', 'v · throw', 'v · where', 'v · one', 'v · yes-string', 'v · empty-array', 'v · false', 'v · function'])
   })
   it('C: the plugin’s own “Use a replica set” advice is a refusal, Mongo’s own message is not', async () => {
     const run = (said: string) => runTransactionCheck({ start: async () => { throw new Error(said) }, write: async () => undefined })
@@ -389,5 +401,140 @@ describe('review round 2', () => {
     expect(order).toMatchObject({ status: 'pass' })
     const [nul] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'n', title: 'n', run: async (w: Viewer) => { throw Object.assign(new Error('Nope'), { status: 403, data: w.role === 'minor' ? null : undefined }) } }] })
     expect(nul).toMatchObject({ status: 'pass' })
+  })
+})
+
+describe('review round 3', () => {
+  /** Shaped like the driver's own errors: the transaction name is in codeName, code and errorLabels, and the message is plain text. */
+  const driverError = (codeName: string, code: number, labels: string[], message: string) => Object.assign(new Error(message), { name: 'MongoServerError', code, codeName, errorLabels: labels })
+  const realShaped = [
+    driverError('NoSuchTransaction', 251, ['TransientTransactionError'], 'Given transaction number 3 does not match any in-progress transactions. The active transaction number is 2'),
+    driverError('WriteConflict', 112, ['TransientTransactionError'], 'Caused by :: Write conflict during plan execution and yielding is disabled. :: Please retry your operation or multi-document transaction.'),
+    driverError('TransactionTooOld', 225, ['TransientTransactionError'], 'Transaction 1 has been aborted.'),
+    // Only the label names it, and only a cause carries the driver error.
+    Object.assign(new Error('write failed'), { name: 'MongoServerError', errorLabels: ['TransientTransactionError'] }),
+    Object.assign(new Error('Could not save'), { cause: driverError('WriteConflict', 112, [], 'Please retry your operation or multi-document transaction.') }),
+    Object.assign(new Error('Could not save'), { status: 403, cause: Object.assign(new Error('x'), { errorLabels: ['TransientTransactionError'] }) }),
+  ]
+  it('reads real-shaped transaction errors as database errors, never as refusals', () => {
+    for (const e of realShaped) {
+      expect(isTransactionError(e) || isDatabaseError(e)).toBe(true)
+      expect(isRefusal(e)).toBe(false)
+    }
+    expect(isTransactionError(realShaped[0])).toBe(true)
+    expect(isTransactionError(realShaped[3])).toBe(true)
+    expect(isTransactionError(realShaped[4])).toBe(true)
+    expect(isRefusal(Object.assign(new Error('No'), { status: 403 }))).toBe(true)
+  })
+  it('1: the transactions check is not-checked for real-shaped errors, at start-up and at the write', async () => {
+    for (const e of realShaped) {
+      expect((await runTransactionCheck({ start: async () => { throw e }, write: async () => undefined }))[0]!.status).toBe('not-checked')
+      const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-shaped', false) }), write: async () => { throw e } })
+      expect(f!.status).toBe('not-checked')
+      // Even a custom pattern that matches the message can't turn a database error into a refusal.
+      const [g] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-shaped', false) }), write: async () => { throw e }, refusal: /./ })
+      expect(g!.status).toBe('not-checked')
+    }
+  })
+  it('1: a real WriteConflict from the in-memory replica set is not a refusal', async () => {
+    const client = new MongoClient(mongo.getUri('conflict'))
+    const s1 = client.startSession()
+    const s2 = client.startSession()
+    let caught: unknown
+    try {
+      await client.connect()
+      const coll = client.db('conflict').collection('rows')
+      await coll.insertOne({ _id: 1 as never, n: 0 })
+      s1.startTransaction()
+      s2.startTransaction()
+      await coll.updateOne({ _id: 1 as never }, { $set: { n: 1 } }, { session: s1 })
+      await coll.updateOne({ _id: 1 as never }, { $set: { n: 2 } }, { session: s2 }).catch((e) => void (caught = e))
+    } finally {
+      await s1.abortTransaction().catch(() => undefined)
+      await s2.abortTransaction().catch(() => undefined)
+      await s1.endSession()
+      await s2.endSession()
+      await client.db('conflict').dropDatabase().catch(() => undefined)
+      await client.close()
+    }
+    expect(caught).toBeTruthy()
+    expect((caught as { codeName?: string }).codeName).toBe('WriteConflict')
+    expect(isTransactionError(caught)).toBe(true)
+    expect(isRefusal(caught)).toBe(false)
+    const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-conflict', false) }), write: async () => { throw caught } })
+    expect(f!.status).toBe('not-checked')
+  })
+  it('2: a validation error is not a refusal anywhere', async () => {
+    const validation = [Object.assign(new Error('The following field is invalid: title'), { name: 'ValidationError', status: 400 }), Object.assign(new Error('bad'), { status: 422 }), Object.assign(new Error('bad'), { status: 400 })]
+    for (const e of validation) {
+      expect(isValidationError(e)).toBe(true)
+      expect(isRefusal(e)).toBe(false)
+    }
+    const boom = (e: unknown) => async () => { throw e }
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'v', title: 'v', run: boom(validation[0]) }] }))[0]!.status).toBe('not-checked')
+    const half = async (who: Viewer) => { if (who.role === 'minor') throw validation[0]; return { ok: true } }
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'v', title: 'v', run: half }] }))[0]!.status).toBe('fail')
+    const [t] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-validation', false) }), write: boom(Object.assign(new Error('transaction field is invalid'), { name: 'ValidationError', status: 400 })) })
+    expect(t!.status).toBe('not-checked')
+    const [h] = await runHostRuleCheck([{ id: 'h', install: () => undefined, attempt: boom(validation[0]) }])
+    expect(h!.status).toBe('not-checked')
+    // A probe with a typo in its data: validation fails for every identity and probe, so nothing passes.
+    const fake = { find: async () => ({ docs: [{ id: 'r' }] }), update: async () => { throw validation[0] }, delete: async () => { throw validation[0] }, create: async () => { throw validation[0] } } as unknown as Payload
+    const typo = await runServerBackDoorCheck(fake, [{ slug: 'notes', identity: owner, protectedWhere: {}, data: { tittle: 'x' }, create: { x: 1 }, holdsForServerCode: true, seed: async () => undefined }])
+    expect(typo).toHaveLength(10)
+    expect(typo.filter((f) => f.status !== 'not-checked')).toEqual([])
+  })
+  it('4: a silent field lock passes, a typo in data or an unchanged value is not-checked, and an open update still fires', async () => {
+    // Straight through the adapter: the plugin's own delete hook refuses to remove a locked row.
+    const wipe = () => payload.db.deleteMany({ collection: 'notes' as never, where: {}, req: {} as never })
+    const seedRow = async () => {
+      await wipe()
+      await payload.create({ collection: 'notes' as never, data: { title: 'kept', owner: owner.id, locked: true } as never, overrideAccess: true })
+    }
+    const col = (data: Record<string, unknown>) => [{ slug: 'notes', identity: owner, protectedWhere: { locked: { equals: true } }, data, seed: seedRow }]
+    const updates = (fs: Finding[]) => fs.filter((f) => /update/.test(f.path!))
+    state.silentLock = true
+    const silent = updates(await runServerBackDoorCheck(payload, col({ title: 'changed' })))
+    expect(silent.map((f) => f.status)).toEqual(['pass', 'pass'])
+    expect(silent[0]!.how).toMatch(/silent lock/)
+    expect(updates(await runServerBackDoorCheck(payload, col({ tittle: 'changed' }))).map((f) => f.status)).toEqual(['not-checked', 'not-checked'])
+    expect(updates(await runServerBackDoorCheck(payload, col({ title: 'kept' }))).map((f) => f.status)).toEqual(['not-checked', 'not-checked'])
+    // The same data on a plugin with no lock at all is a hole.
+    state.silentLock = false
+    state.txHole = true
+    expect(updates(await runServerBackDoorCheck(payload, col({ title: 'changed' }))).map((f) => f.status)).toEqual(['pass', 'fail'])
+    await wipe()
+  })
+  it('4: a delete or create that answers but leaves nothing changed passes', async () => {
+    const calls: string[] = []
+    const rows = [{ id: 'r1', title: 'kept' }]
+    const fake = {
+      find: async () => ({ docs: rows }),
+      findByID: async ({ id }: { id: string }) => (id === 'ghost' ? null : rows[0]),
+      update: async () => ({ docs: [], errors: [] }),
+      delete: async () => (calls.push('d'), { id: 'r1' }),
+      create: async () => ({ id: 'ghost' }),
+    } as unknown as Payload
+    const out = await runServerBackDoorCheck(fake, [{ slug: 'notes', identity: owner, protectedWhere: {}, data: { title: 'x' }, create: { title: 'y' }, seed: async () => undefined }])
+    const by = Object.fromEntries(out.map((f) => [f.path!.split(' · ')[1], f]))
+    expect(by['delete-no-transaction']).toMatchObject({ status: 'pass' })
+    expect(by['delete-no-transaction']!.how).toMatch(/still there/)
+    expect(by['create-no-transaction']!.how).toMatch(/no new row/)
+  })
+  it('5: a bulk refusal passes only when it carries a recognized refusal or the standard message', async () => {
+    const fake = (errors: object[]) => ({
+      find: async () => ({ docs: [{ id: 'row1', title: 'kept' }] }),
+      findByID: async () => ({ id: 'row1', title: 'kept' }),
+      update: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : Promise.reject(Object.assign(new Error('No'), { status: 403 }))),
+      delete: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : Promise.reject(Object.assign(new Error('No'), { status: 403 }))),
+      create: async () => Promise.reject(Object.assign(new Error('No'), { status: 403 })),
+    }) as unknown as Payload
+    const col = [{ slug: 'notes', identity: owner, protectedWhere: {}, data: { title: 'x' }, holdsForServerCode: true, seed: async () => undefined }]
+    const bulk = (fs: Finding[]) => fs.filter((f) => f.path!.includes('bulk')).map((f) => f.status)
+    expect(bulk(await runServerBackDoorCheck(fake([{ message: 'You are not allowed to perform this action.' }]), col))).toEqual(['pass', 'pass', 'pass', 'pass'])
+    expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.', status: 403 }]), col))).toEqual(['pass', 'pass', 'pass', 'pass'])
+    expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.' }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+    expect(bulk(await runServerBackDoorCheck(fake([{ message: 'The following field is invalid: title', status: 400 }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+    expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.' }]), col, { isRefusal: (e) => /Members only/.test(String((e as Error).message)) }))).toEqual(['pass', 'pass', 'pass', 'pass'])
   })
 })

@@ -16,15 +16,62 @@ import type { Finding, Severity, Viewer } from './index.js'
 
 const statusOf = (e: unknown): number => Number((e as { status?: unknown })?.status ?? (e as { statusCode?: unknown })?.statusCode ?? NaN)
 
-/** Statuses and error names that mean "the system said no": validation, sign-in, forbidden and not found. */
-const REFUSAL_STATUSES = [400, 401, 403, 404, 422]
-const REFUSAL_NAMES = ['Forbidden', 'UnauthorizedError', 'ValidationError', 'NotFound']
+/** Statuses and error names that mean "the system said no": sign-in, forbidden and not found. Validation is not one. */
+const REFUSAL_STATUSES = [401, 403, 404]
+const REFUSAL_NAMES = ['Forbidden', 'UnauthorizedError', 'NotFound']
+const TX_CODE_NAMES = ['NoSuchTransaction', 'WriteConflict', 'TransactionTooOld', 'TransactionAborted', 'TransactionCommitted', 'OperationNotSupportedInTransaction', 'TransactionExceededLifetimeLimitSeconds']
+const TX_CODES = [112, 225, 244, 251, 256, 263, 290]
+const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult']
+
+const causesOf = (e: unknown): unknown[] => {
+  const x = e as { cause?: unknown; errors?: unknown } | null
+  const list: unknown[] = []
+  if (x?.cause !== undefined && x.cause !== null) list.push(x.cause)
+  if (Array.isArray(x?.errors)) list.push(...x.errors)
+  return list
+}
+const labelsOf = (e: unknown): string[] => {
+  const l = (e as { errorLabels?: unknown } | null)?.errorLabels
+  return Array.isArray(l) ? l.map(String) : l instanceof Set ? [...l].map(String) : []
+}
+
 /**
- * Whether an error is a proper refusal. HTTP 400, 401, 403, 404 or 422, or Payload's Forbidden, UnauthorizedError,
- * ValidationError and NotFound. A plain Error, a database error such as NoSuchTransaction, or a 5xx is not.
+ * Whether an error is the database's own transaction trouble: a driver error with a transaction `codeName`
+ * (NoSuchTransaction, WriteConflict ...), code, or `errorLabels` entry (TransientTransactionError), on the error
+ * or on anything in its `cause` chain. Real driver errors carry the name only in those fields; their message
+ * is plain text.
+ */
+export function isTransactionError(error: unknown, depth = 0): boolean {
+  if (error === null || typeof error !== 'object' || depth > 6) return false
+  const e = error as { codeName?: unknown; code?: unknown; name?: unknown }
+  if (TX_CODE_NAMES.includes(String(e.codeName)) || TX_CODE_NAMES.includes(String(e.name))) return true
+  if (typeof e.code === 'number' && TX_CODES.includes(e.code) && (typeof e.codeName === 'string' || /^Mongo/.test(String(e.name)))) return true
+  if (labelsOf(error).some((l) => TX_LABELS.includes(l))) return true
+  return causesOf(error).some((c) => isTransactionError(c, depth + 1))
+}
+
+/** Whether an error comes from the database driver (Mongo's own errors, transaction or not): never the plugin saying no. */
+export function isDatabaseError(error: unknown, depth = 0): boolean {
+  if (error === null || typeof error !== 'object' || depth > 6) return false
+  const e = error as { codeName?: unknown; name?: unknown }
+  if (isTransactionError(error) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || labelsOf(error).length > 0) return true
+  return causesOf(error).some((c) => isDatabaseError(c, depth + 1))
+}
+
+/** A validation error: status 400 or 422, or the name ValidationError. A typo in a probe's data looks like this, so it says nothing about access. */
+export function isValidationError(error: unknown): boolean {
+  const e = error as { name?: unknown } | null
+  return [400, 422].includes(statusOf(error)) || String(e?.name) === 'ValidationError'
+}
+
+/**
+ * Whether an error is a proper refusal: HTTP 401, 403 or 404, or Payload's Forbidden, UnauthorizedError and
+ * NotFound. Not a refusal: a validation error (400, 422, ValidationError), a database or transaction error
+ * (checked on the error and its `cause`, by name, `codeName` and `errorLabels`), a plain Error, a 5xx.
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
+  if (isDatabaseError(error) || isValidationError(error)) return false
   return REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))
 }
 const clip = (s: string, n = 100) => (s.length > n ? `${s.slice(0, n)}…` : s)
@@ -209,7 +256,8 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 // ---------------------------------------------------------------------------------------------------------
 
 /** Mongo's own complaints about transactions are not the plugin refusing. */
-const DEFAULT_TX_REFUSAL = (said: string) => /transaction/i.test(said) && !/NoSuchTransaction|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|TransientTransactionError|WriteConflict/i.test(said)
+const MONGO_TX_WORDS = /NoSuchTransaction|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|TransientTransactionError|WriteConflict|write conflict|in-progress transaction|has been aborted|multi-document transaction|retry your operation|Given transaction number/i
+const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.test(said) && !MONGO_TX_WORDS.test(said) && !isValidationError(error)
 
 /**
  * A plugin that relies on transactions must refuse to run without them. Payload starts without transactions
@@ -224,22 +272,24 @@ const DEFAULT_TX_REFUSAL = (said: string) => /transaction/i.test(said) && !/NoSu
  *   as is a guard that reads `req.transactionID` without awaiting it.
  *
  * `refusal` says what a proper refusal looks like; by default an error that mentions transactions but isn't
- * one of Mongo's own (NoSuchTransaction, "Transaction numbers are only allowed on a replica set member").
- * Any other error is "not checked".
+ * one of the database's own. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
+ * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, never by
+ * the message alone, and a database error is never a refusal, whatever `refusal` matches. A validation error is
+ * not one by default. Any other error is "not checked".
  */
 export async function runTransactionCheck(input: {
   start: () => Promise<{ payload: Payload; stop?: () => Promise<void> }>
   /** A write the plugin protects with a transaction, made on the instance `start` returned. */
   write: (payload: Payload) => Promise<unknown>
   mode?: 'off-at-start' | 'null-after-start'
-  refusal?: RegExp | ((said: string) => boolean)
+  refusal?: RegExp | ((said: string, error: unknown) => boolean)
   severity?: Severity
 }): Promise<Finding[]> {
   const sev = input.severity ?? 'high'
   const mode = input.mode ?? 'off-at-start'
   const check = 'transactions-required'
   const title = mode === 'off-at-start' ? 'A plugin that needs transactions refuses to run without them' : 'A plugin that needs transactions refuses a write when beginTransaction answers null'
-  const refuses = (said: string) => (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said))
+  const refuses = (said: string, error: unknown) => !isDatabaseError(error) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
   const role = 'server'
   let started: Awaited<ReturnType<typeof input.start>> | undefined
   let restore: (() => void) | undefined
@@ -248,7 +298,7 @@ export async function runTransactionCheck(input: {
       started = await input.start()
     } catch (e) {
       const said = messageOf(e)
-      if (mode === 'off-at-start' && refuses(said)) return [{ check, title, severity: sev, status: 'pass', role, path: 'start-up', how: 'It refused to start without transactions.' }]
+      if (mode === 'off-at-start' && refuses(said, e)) return [{ check, title, severity: sev, status: 'pass', role, path: 'start-up', how: 'It refused to start without transactions.' }]
       return [note(check, title, role, `Start-up failed for another reason: ${clip(said, 120)}`, 'start-up', sev)]
     }
     const { payload } = started
@@ -273,7 +323,7 @@ export async function runTransactionCheck(input: {
       await input.write(payload)
     } catch (e) {
       const said = messageOf(e)
-      return refuses(said)
+      return refuses(said, e)
         ? [{ check, title, severity: sev, status: 'pass', role, path: 'write', how: 'The write was refused because transactions are off.' }]
         : [note(check, title, role, `The write failed for another reason: ${clip(said, 120)}`, 'write', sev)]
     }
@@ -314,64 +364,129 @@ export type ProtectedCollection = {
  * `{ docs, errors }` instead of throwing, so a rule that only guards single writes, or that commits one document
  * at a time, lets them through.
  *
- * Only a recognized refusal passes (see `isRefusal`). Any other error, and any bulk error entry that isn't a
- * recognized refusal (a TypeError reported in `errors`, a database failure), are "not-checked".
+ * An answer is never taken at its word: after each probe the rows are read again. An update counts as let through
+ * only if a field in `data` changed, a delete only if the row is gone, a create only if the new row exists. A
+ * rule that quietly puts the old value back, or quietly keeps the row, answers without an error and is a pass.
+ * When an update changes nothing and wasn't refused, the check writes `data` straight through the database
+ * adapter (no hooks, no access) to prove `data` can change the row at all; if it can't, the probe is not-checked,
+ * since a typo in `data` would otherwise read as a lock. That control write is undone by `seed`.
+ *
+ * Only a recognized refusal passes as a refusal (see `isRefusal`). Any other error, and any bulk error entry
+ * that isn't one, are "not-checked". A bulk `errors` entry only has a message, so it counts as refused only
+ * when `isRefusal` accepts it (a `status` or `name` on the entry) or its message is Payload's standard "not
+ * allowed to perform this action" or says forbidden. Pass your own `isRefusal` for any other wording.
  */
 export async function runServerBackDoorCheck(payload: Payload, collections: ProtectedCollection[], options: { isRefusal?: (error: unknown) => boolean } = {}): Promise<Finding[]> {
   const out: Finding[] = []
   const refusal = options.isRefusal ?? isRefusal
   type Result = { docs?: unknown[]; errors?: { message?: string }[] }
+  type Ran = { refused?: boolean; createdId?: string | number }
   for (const c of collections) {
     const role = c.identity.role
     const base = { collection: c.slug as never, user: c.identity.user as never }
     const server = { collection: c.slug as never, overrideAccess: true as const }
-    const bulk = (r: unknown): boolean => {
+    // A bulk answer: errors that aren't a recognized refusal are not-checked; recognized refusals mean refused.
+    const bulk = (r: unknown): Ran => {
       const res = r as Result
-      if ((res.docs?.length ?? 0) > 0) return true
-      // Any error in the list that isn't a recognized refusal says nothing about access, so it is "not-checked".
-      const other = res.errors?.find((e) => !refusal(e) && !/not allowed to perform|forbidden/i.test(String(e?.message)))
+      const errors = res.errors ?? []
+      const other = errors.find((e) => !refusal(e) && !/not allowed to perform|forbidden/i.test(String(e?.message)))
       if (other) throw Object.assign(new Error(`bulk operation error: ${clip(messageOf(other), 80)}`), { crash: true })
-      return false
+      return { refused: (res.docs?.length ?? 0) === 0 && errors.length > 0 }
     }
-    const probes: { id: string; title: string; run: (id: string | number) => Promise<boolean>; delete?: boolean }[] = [
-      { id: 'bulk-update', title: 'Bulk update with a where', run: async () => bulk(await payload.update({ ...base, where: c.protectedWhere as never, data: c.data as never, overrideAccess: false })) },
-      { id: 'bulk-delete', title: 'Bulk delete with a where', delete: true, run: async () => bulk(await payload.delete({ ...base, where: c.protectedWhere as never, overrideAccess: false })) },
-      { id: 'update-no-transaction', title: 'Update by id with disableTransaction', run: async (id) => !!(await payload.update({ ...base, id, data: c.data as never, overrideAccess: false, disableTransaction: true })) },
-      { id: 'delete-no-transaction', title: 'Delete by id with disableTransaction', delete: true, run: async (id) => !!(await payload.delete({ ...base, id, overrideAccess: false, disableTransaction: true })) },
+    const created = (doc: unknown): Ran => ({ createdId: (doc as { id?: string | number } | null)?.id })
+    type Probe = { id: string; title: string; kind: 'update' | 'delete' | 'create'; run: (id: string | number) => Promise<Ran> }
+    const probes: Probe[] = [
+      { id: 'bulk-update', kind: 'update', title: 'Bulk update with a where', run: async () => bulk(await payload.update({ ...base, where: c.protectedWhere as never, data: c.data as never, overrideAccess: false })) },
+      { id: 'bulk-delete', kind: 'delete', title: 'Bulk delete with a where', run: async () => bulk(await payload.delete({ ...base, where: c.protectedWhere as never, overrideAccess: false })) },
+      { id: 'update-no-transaction', kind: 'update', title: 'Update by id with disableTransaction', run: async (id) => (await payload.update({ ...base, id, data: c.data as never, overrideAccess: false, disableTransaction: true }), {}) },
+      { id: 'delete-no-transaction', kind: 'delete', title: 'Delete by id with disableTransaction', run: async (id) => (await payload.delete({ ...base, id, overrideAccess: false, disableTransaction: true }), {}) },
     ]
-    if (c.create) probes.push({ id: 'create-no-transaction', title: 'Create with disableTransaction', run: async () => !!(await payload.create({ ...base, data: c.create as never, overrideAccess: false, disableTransaction: true })) })
+    if (c.create) probes.push({ id: 'create-no-transaction', kind: 'create', title: 'Create with disableTransaction', run: async () => created(await payload.create({ ...base, data: c.create as never, overrideAccess: false, disableTransaction: true })) })
     if (c.holdsForServerCode) {
       probes.push(
-        { id: 'update-override-access', title: 'Update by id with overrideAccess', run: async (id) => !!(await payload.update({ ...base, id, data: c.data as never, overrideAccess: true })) },
-        { id: 'delete-override-access', title: 'Delete by id with overrideAccess', delete: true, run: async (id) => !!(await payload.delete({ ...base, id, overrideAccess: true })) },
+        { id: 'update-override-access', kind: 'update', title: 'Update by id with overrideAccess', run: async (id) => (await payload.update({ ...base, id, data: c.data as never, overrideAccess: true }), {}) },
+        { id: 'delete-override-access', kind: 'delete', title: 'Delete by id with overrideAccess', run: async (id) => (await payload.delete({ ...base, id, overrideAccess: true }), {}) },
       )
-      if (c.create) probes.push({ id: 'create-override-access', title: 'Create with overrideAccess', run: async () => !!(await payload.create({ ...base, data: c.create as never, overrideAccess: true })) })
+      if (c.create) probes.push({ id: 'create-override-access', kind: 'create', title: 'Create with overrideAccess', run: async () => created(await payload.create({ ...base, data: c.create as never, overrideAccess: true })) })
       probes.push(
-        { id: 'bulk-update-server-code', title: 'Bulk update from server code (no user, overrideAccess)', run: async () => bulk(await payload.update({ ...server, where: c.protectedWhere as never, data: c.data as never })) },
-        { id: 'bulk-delete-server-code', title: 'Bulk delete from server code (no user, overrideAccess)', delete: true, run: async () => bulk(await payload.delete({ ...server, where: c.protectedWhere as never })) },
+        { id: 'bulk-update-server-code', kind: 'update', title: 'Bulk update from server code (no user, overrideAccess)', run: async () => bulk(await payload.update({ ...server, where: c.protectedWhere as never, data: c.data as never })) },
+        { id: 'bulk-delete-server-code', kind: 'delete', title: 'Bulk delete from server code (no user, overrideAccess)', run: async () => bulk(await payload.delete({ ...server, where: c.protectedWhere as never })) },
       )
     }
+    const dataKeys = Object.keys(c.data)
+    const fieldNames = (slug: string): Set<string> | null => {
+      const cfg = (payload as unknown as { collections?: Record<string, { config?: { flattenedFields?: { name?: string }[]; fields?: { name?: string }[] } }> }).collections?.[slug]?.config
+      const list = cfg?.flattenedFields ?? cfg?.fields
+      return list ? new Set(['id', 'createdAt', 'updatedAt', ...list.map((f) => String(f.name))]) : null
+    }
+    const pick = (doc: unknown) => Object.fromEntries(dataKeys.map((k) => [k, (doc as Record<string, unknown> | null)?.[k]]))
+    const readAll = async () => ((await payload.find({ collection: c.slug as never, where: c.protectedWhere as never, limit: 100, depth: 0, pagination: false, overrideAccess: true })).docs as { id: string | number }[])
+    const readOne = async (id: string | number) => (await payload.findByID({ collection: c.slug as never, id, depth: 0, overrideAccess: true, disableErrors: true })) as { id: string | number } | null
     for (const p of probes) {
       const check = 'server-code-back-door'
       const title = `${c.slug}: ${p.title} is refused`
       const path = `${c.slug} · ${p.id}`
       try {
         await c.seed()
-        const found = await payload.find({ collection: c.slug as never, where: c.protectedWhere as never, limit: 1, depth: 0, pagination: false, overrideAccess: true })
-        const row = (found.docs[0] as { id?: string | number } | undefined)?.id
+        const before = await readAll()
+        const row = before[0]?.id
         if (row === undefined) {
           out.push(note(check, title, role, 'After seeding, no row matched protectedWhere, so there was nothing to try.', path))
           continue
         }
-        let allowed: boolean
+        let ran: Ran
+        let refused = false
         try {
-          allowed = await p.run(row)
+          ran = await p.run(row)
+          refused = Boolean(ran.refused)
         } catch (e) {
           if ((e as { crash?: boolean }).crash || !refusal(e)) {
             out.push(note(check, title, role, `The probe failed with an error that isn’t a refusal: ${clip(messageOf(e), 120)}`, path))
             continue
           }
-          allowed = false
+          ran = {}
+          refused = true
+        }
+        // Read the rows again: an answer without an error doesn't say anything changed.
+        let allowed = false
+        let how = refused ? 'Refused.' : ''
+        if (p.kind === 'create') {
+          allowed = ran.createdId !== undefined && (await readOne(ran.createdId)) !== null
+          if (!refused) how = allowed ? '' : 'The create answered without an error, but no new row exists.'
+        } else if (p.kind === 'delete') {
+          const gone = (await Promise.all(before.map((d) => readOne(d.id)))).some((d) => d === null)
+          allowed = gone
+          if (!refused && !gone) how = 'The delete answered without an error, but the row is still there.'
+        } else {
+          const now = await Promise.all(before.map((d) => readOne(d.id)))
+          allowed = before.some((d, i) => json(pick(d)) !== json(pick(now[i])))
+          if (!allowed && !refused) {
+            // Nothing changed and nothing was refused. Is that a lock, or can `data` not change the row at all?
+            if (before.every((d) => json(pick(d)) === json(c.data))) {
+              out.push(note(check, title, role, 'The fields in data already hold those values, so a change couldn’t show. Use values that differ from the seeded row.', path))
+              continue
+            }
+            const known = fieldNames(c.slug)
+            const unknown = known ? dataKeys.filter((k) => !known.has(k)) : []
+            if (unknown.length) {
+              out.push(note(check, title, role, `The update changed nothing, and ${unknown.join(', ')} ${unknown.length === 1 ? 'isn’t a field' : 'aren’t fields'} of ${c.slug}, so data may have a typo. Nothing was learned.`, path))
+              continue
+            }
+            await c.seed()
+            const fresh = await readAll()
+            const target = fresh[0]
+            let writable = false
+            if (target) {
+              await payload.db.updateOne({ collection: c.slug as never, id: target.id, data: c.data as never, req: {} as never, returning: false } as never)
+              writable = json(pick(await readOne(target.id))) === json(Object.fromEntries(dataKeys.map((k) => [k, c.data[k]])))
+            }
+            await c.seed()
+            if (!writable) {
+              out.push(note(check, title, role, 'The update changed nothing, and writing data straight through the database didn’t change the row either, so data may not be writable. Nothing was learned.', path))
+              continue
+            }
+            how = 'The update answered without an error, but the field kept its old value (a silent lock).'
+          }
         }
         out.push({
           check,
@@ -380,8 +495,8 @@ export async function runServerBackDoorCheck(payload: Payload, collections: Prot
           status: allowed ? 'fail' : 'pass',
           role,
           path,
-          how: allowed ? `The rule was skipped: ${p.title.toLowerCase()} got through.` : 'Refused, or nothing was changed.',
-          reproduce: allowed ? `From server code, call payload.${p.id.includes('delete') ? 'delete' : p.id.includes('create') ? 'create' : 'update'} on ${c.slug} (${p.id}).` : undefined,
+          how: allowed ? `The rule was skipped: ${p.title.toLowerCase()} got through.` : how || 'Refused.',
+          reproduce: allowed ? `From server code, call payload.${p.kind} on ${c.slug} (${p.id}).` : undefined,
         })
       } catch (e) {
         out.push(note(check, title, role, `The probe could not run: ${clip(messageOf(e), 120)}`, path))
@@ -420,11 +535,14 @@ export type HostRuleOption = {
    * `access` (default): the option can widen what the plugin allows. The attempt is something the default
    * refuses, and only the answers in `mayWiden` may change that.
    * `veto`: the option can refuse something the plugin allows. The attempt is something the default allows.
-   * An exact `true` must refuse it, and so must a reason string (`'yes'`) and a throw (a broken veto fails closed). The other answers
-   * (null, 0, an empty string, false, undefined and so on) mean go ahead or are the plugin's choice, so any
-   * allow or refusal is accepted for them; only a crash is flagged.
+   * Strict answers: only the answers in `goAhead` (default `null` and `undefined`) may leave the operation
+   * allowed. Every other answer must refuse it: `true`, a reason string, `{}`, `[]`, 1, 0, an empty string,
+   * false, a function, a narrow where, and a throw (a broken veto fails closed). If a plugin documents another
+   * answer as "go ahead", say so in `goAhead`; the report then says that answer was allowed by contract.
    */
   kind?: 'access' | 'veto'
+  /** Veto options only. Answers that mean "no veto". Default `['null', 'undefined']`. */
+  goAhead?: HostAnswerName[]
   /**
    * Installs the host's answer as that option's value: return the answer from the hook, or throw it when
    * `answer.throws`. Called with `undefined` first and last, for the plugin's own default.
@@ -477,6 +595,7 @@ export async function runHostRuleCheck(options: HostRuleOption[]): Promise<Findi
         continue
       }
       const widen = new Set<HostAnswerName>(o.mayWiden ?? ['true'])
+      const goAhead = new Set<HostAnswerName>(o.goAhead ?? ['null', 'undefined'])
       for (const answer of HOST_ANSWERS) {
         const title = `${o.id}: a host answer of ${answer.name} ${veto ? 'is handled safely' : 'keeps the default restriction'}`
         const path = `${o.id} · ${answer.name}`
@@ -489,9 +608,9 @@ export async function runHostRuleCheck(options: HostRuleOption[]): Promise<Findi
         let wrong: boolean
         let how: string
         if (veto) {
-          const mustRefuse = answer.name === 'true' || answer.name === 'yes-string' || answer.name === 'throw'
+          const mustRefuse = !goAhead.has(answer.name)
           wrong = mustRefuse && result === 'allowed'
-          how = wrong ? `A veto answer of ${answer.name} didn’t stop the operation.` : mustRefuse ? 'The veto applied.' : `${answer.name} isn’t a veto; the operation was ${result}.`
+          how = wrong ? `A veto answer of ${answer.name} didn’t stop the operation.` : mustRefuse ? 'The veto applied.' : `${answer.name} is documented as go ahead; the operation was ${result}.`
         } else {
           wrong = result === 'allowed' && !widen.has(answer.name)
           how = wrong ? `A host answer of ${answer.name} switched a default restriction off.` : result === 'allowed' ? `${answer.name} is allowed to widen this option, and did.` : 'The default restriction still applied.'

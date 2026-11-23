@@ -17,9 +17,11 @@ export const state = {
   accessOnly: false,
   /** The lock hook only runs when a transaction exists (disableTransaction skips it). */
   txHole: false,
+  /** Updates to a locked row are allowed through access, then quietly put back to the old title by a hook (no error). */
+  silentLock: false,
   /** A veto answer counts when merely truthy, and a thrown veto means go ahead. */
   looseVeto: false,
-  /** A veto that only refuses on an exact true, and ignores a reason string. */
+  /** A veto that only refuses on an exact true, and ignores every other answer. */
   trueOnlyVeto: false,
   /** Every guarded write dies with a database error, as a transaction failure would. */
   crash: false,
@@ -44,7 +46,7 @@ const notes: CollectionConfig = {
     update: ({ req, id }) => {
       if (!req.user) return false
       const mine = { owner: { equals: owner(req.user) } }
-      if (state.txHole) return mine
+      if (state.txHole || state.silentLock) return mine
       const unlocked = { and: [mine, { locked: { not_equals: true } }] }
       return state.bulkHole && !id ? mine : unlocked
     },
@@ -67,6 +69,7 @@ const notes: CollectionConfig = {
           return data
         }
         if (state.bulkHole || operation !== 'update') return data
+        if (state.silentLock) return (originalDoc as { locked?: boolean } | undefined)?.locked ? { ...data, title: (originalDoc as { title?: string }).title } : data
         if ((originalDoc as { locked?: boolean } | undefined)?.locked) throw new Forbidden(req.t)
         return data
       },
@@ -99,7 +102,7 @@ const invites: CollectionConfig = {
         let vetoed = false
         try {
           const answer = await state.host.vetoInvite?.(target)
-          vetoed = state.looseVeto ? Boolean(answer) : answer === true || (!state.trueOnlyVeto && typeof answer === 'string' && answer !== '')
+          vetoed = state.looseVeto ? Boolean(answer) : state.trueOnlyVeto ? answer === true : answer !== undefined && answer !== null
         } catch {
           vetoed = !state.looseVeto
         }

@@ -2,7 +2,7 @@
 
 Whitehat for Payload: finds security holes in a Payload site, its database, code and UI, with severity-ranked alerts and a checklist that grows with every incident.
 
-**Status:** early. 0.2.2 is on npm (2026-11-14). 74 tests.
+**Status:** early. 0.2.2 is on npm (2026-11-14). 93 tests.
 - **The access check** works; its tests include the two real leaks it was written to catch (a private related record's id in a public read, and a refusal that answered a question it shouldn't).
 - **Checklist checks:** nine are automated, each tested against made-up responses (`CHECKLIST.md` says which).
 - **Alerts:** the collection, bulk snooze and Retest selected were tried in a real Payload admin on a local copy of a site, with made-up findings. Saving a snooze, retesting and the refusal messages worked.
@@ -22,7 +22,7 @@ Whitehat for Payload: finds security holes in a Payload site, its database, code
   - New critical alerts call `onCritical` once, so the site can tell the owner.
   - Nobody sees alerts without the site's `access`, and only an answer of exactly `true` lets someone in. Anything else is a no: `false`, `1`, `'yes'`, an object (one shaped like a query included, so it can't become a read filter), or an error thrown or rejected. A broken rule refuses with 403 instead of a 500, and nobody who isn't signed in gets in, whatever `access` says. Since 0.2.2: before, any truthy answer let someone in, and an object went to Payload as the alerts' read and update access.
 - **It only finds.** It never fixes anything, changes data or settings, or touches anything outside the site you run it against.
-- **Review-finding checks.** Functions a plugin repo runs in its own tests against a Payload instance: a response-difference probe, a transactions-off check, server-code back doors (bulk, `disableTransaction`, `overrideAccess`), host rules that replace defaults, and a small source lint. They report and never fix, but the probes write: they try to create, change and delete rows in the collections you name, so run them on a throwaway database. An error that isn't a recognized refusal is reported as not checked, never as a pass. See `docs/review-checks.md`.
+- **Review-finding checks.** Functions a plugin repo runs in its own tests against a Payload instance: a response-difference probe, a transactions-off check, server-code back doors (bulk, `disableTransaction`, `overrideAccess`), host rules that replace defaults, and a small source lint. They report and never fix, but the probes write: they try to create, change and delete rows in the collections you name, so run them on a throwaway database. An error that isn't a recognized refusal (a validation error and database errors such as WriteConflict included) is reported as not checked, never as a pass. See `docs/review-checks.md`.
 
 Run it against a throwaway or test database. Never point write probes at a live site. A suite that tries writes is declared as `{ run, writes: true }`, and the plugin refuses to start with one unless `allowWriteProbes: true`, which belongs only on a throwaway test copy: **Retest selected** runs suites inside the site.
 

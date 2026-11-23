@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-23 (round 3): fail-closed fixes
+
+Suite: 84 tests before, 93 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
+
+- **Covered.** Errors shaped like the driver's (codeName, code, errorLabels, plain message, and a `cause`) are never refusals, at start-up and at the write, even with a custom pattern that matches the message; a real WriteConflict raised by two overlapping transactions on the in-memory replica set; validation errors (400, 422, ValidationError) are not-checked in all four checks; veto mode for every answer (strict default, a loose variant that fails on 0, an empty string, false and a throw, a true-only variant that fails on nine answers, and `goAhead`); a silent field lock passes, a typo in `data` or a value equal to the seeded one is not-checked, a plugin with no lock fails; a delete that leaves the row and a create that leaves no row pass; bulk refusal wording (standard message, status on the entry, custom message, validation entry, custom `isRefusal`); symbolic links skipped by the lint.
+- **Cleanup.** `closeAll` destroys every instance, then stops Mongo with cleanup and force even when a destroy throws, and the test fails if either step reports a problem. Checked after a run under a private temp folder: no `mongo-mem` folder, no mongod process, no new Docker volume.
+- **Skipped.** A silent lock on delete (the fixture can't make a delete quietly do nothing); NoSuchTransaction from a live server (hard to trigger on demand; the shaped objects and the real WriteConflict share the same fields); a grant-time veto probe has no counterpart in this repo, since the veto check takes the caller's own `attempt`.
+
 ## 2026-11-23: review-finding checks
 
 Suite: 38 tests before, 74 after (`npx vitest run`; `review.test.ts` on real Payload 3.92 and in-memory MongoDB, `lint.test.ts` on text).

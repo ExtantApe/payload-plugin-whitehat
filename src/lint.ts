@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { lstatSync, readdirSync, readFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 
 import type { Finding } from './index.js'
@@ -122,15 +122,17 @@ export function lintSource(path: string, source: string, shared: Map<string, str
   return out
 }
 
-/** Lints every .ts, .tsx, .js, .mjs file under `dir` (skipping node_modules, dist and test folders). Returns one pass finding when clean. */
+/** Lints every .ts, .tsx, .js, .mjs file under `dir` (skipping node_modules, dist and test folders, and symbolic links, which are never followed). Returns one pass finding when clean. */
 export function lintDirectory(dir: string): Finding[] {
   const files: string[] = []
   const walk = (d: string) => {
     for (const name of readdirSync(d)) {
       if (['node_modules', 'dist', '.git', 'test', 'tests', '__tests__'].includes(name)) continue
       const p = join(d, name)
-      if (statSync(p).isDirectory()) walk(p)
-      else if (/\.(tsx?|mjs|js)$/.test(name) && !/\.(test|spec|d)\.[tj]s$/.test(name)) files.push(p)
+      const st = lstatSync(p)
+      if (st.isSymbolicLink()) continue
+      if (st.isDirectory()) walk(p)
+      else if (st.isFile() && /\.(tsx?|mjs|js)$/.test(name) && !/\.(test|spec|d)\.[tj]s$/.test(name)) files.push(p)
     }
   }
   walk(dir)
