@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-23 (round 5): one list of driver words, and nested messages
+
+Suite: 103 tests before, 109 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
+
+- **Covered.** Real driver message text (in-progress transactions, expired sessions, multi-document transaction) as a plain Error with only a message: never a refusal under a custom `isRefusal` in the server back-door check (bulk and single), the response-difference probe and the host-rule check; the transactions check with `/./` and a predicate, in both modes and at start-up. A driver message in a nested `cause`, `errorResponse` or `errors` entry is a database error on every path. A nested ordinary refusal still passes and a 50-deep chain terminates. `goAhead` also rejects raw 0 and '' alone and mixed with allowed names. Five of the six new cases fail on the old code; the sixth guards ordinary refusals.
+- **Updated.** The two word lists merged into one; the `goAhead` rejection test gained raw values.
+- **Skipped.** A real expired session on a live server (not triggerable on demand).
+
 ## 2026-11-23 (round 4): custom refusal predicates and the veto go-ahead list
 
 Suite: 93 tests before, 103 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).

@@ -327,7 +327,7 @@ describe('4. host rules that replace defaults', () => {
       expect(names(await runHostRuleCheck([veto()]))).toEqual(expected)
     })
     it('throws a config error for a goAhead that would turn the veto check off', async () => {
-      for (const bad of [['true'], ['throw'], ['null', 'empty-object'], ['zero'], ['where'], ['function']]) {
+      for (const bad of [['true'], ['throw'], ['null', 'empty-object'], ['zero'], ['where'], ['function'], [0], [''], ['null', 0], ['undefined', '']]) {
         await expect(runHostRuleCheck([{ ...veto(), goAhead: bad as never }])).rejects.toThrow(/config error.*only null, undefined and false/)
       }
       await expect(runHostRuleCheck([{ ...veto(), goAhead: 'true' as never }])).rejects.toThrow(/config error/)
@@ -626,5 +626,86 @@ describe('review round 4: a custom isRefusal never turns a database error into a
     for (const m of killed) expect(isDatabaseErrorMessage(m), m).toBe(true)
     for (const m of ['You are not allowed to perform this action.', 'Use a replica set', 'Transactions are required', 'Members only.', 'Forbidden', 'Your session has expired', 'The user was killed in the game']) expect(isDatabaseErrorMessage(m), m).toBe(false)
     expect(isRefusal(Object.assign(new Error('Transaction 1 has been aborted.'), { status: 403 }))).toBe(false)
+  })
+})
+
+describe('review round 5: real driver wording, and database messages nested in a cause', () => {
+  const everything = () => true
+  const slash = (e: unknown) => /./.test(String((e as Error).message))
+  /** Plain Errors with only a message, as a wrapper or a bulk entry would carry them. */
+  const real = [
+    'Given transaction number 7 does not match any in-progress transactions. The active transaction number is 8',
+    'Use of expired sessions is not permitted',
+    "Cannot run 'drop' in a multi-document transaction.",
+  ]
+  const col = [{ slug: 'notes', identity: { role: 'owner', user: { id: 'u1' } } as unknown as Viewer, protectedWhere: {}, data: {}, holdsForServerCode: true, seed: async () => undefined }]
+  const denied = () => Promise.reject(Object.assign(new Error('No'), { status: 403 }))
+  const fake = (errors: { message: string }[], single: () => Promise<unknown> = denied) =>
+    ({
+      find: async () => ({ docs: [{ id: 'row1' }] }),
+      findByID: async () => ({ id: 'row1' }),
+      update: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
+      delete: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
+      create: denied,
+    }) as unknown as Payload
+  const statuses = (fs: Finding[], pick: (path: string) => boolean) => fs.filter((f) => pick(f.path!)).map((f) => f.status)
+
+  it('real driver message text is a database message, and ordinary refusals still are not', () => {
+    for (const m of real) expect(isDatabaseErrorMessage(m), m).toBe(true)
+    for (const m of ['Members only', 'Use a replica set', 'Your session has expired', 'Transactions are required']) expect(isDatabaseErrorMessage(m), m).toBe(false)
+  })
+  it('a custom isRefusal cannot turn real driver wording into a refusal, in bulk and single-document writes', async () => {
+    for (const message of real) {
+      for (const fn of [everything, slash]) {
+        const bulk = await runServerBackDoorCheck(fake([{ message }]), col, { isRefusal: fn })
+        expect(statuses(bulk, (p) => p.includes('bulk')), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+        const one = await runServerBackDoorCheck(fake([], () => Promise.reject(new Error(message))), col, { isRefusal: fn })
+        expect(statuses(one, (p) => !p.includes('bulk') && !p.includes('create')), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+      }
+    }
+  })
+  it('the response-difference probe and the host-rule check reject real driver wording under a custom isRefusal', async () => {
+    for (const message of real) {
+      const [d] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: async () => { throw new Error(message) } }], isRefusal: everything })
+      expect(d!.status, message).toBe('not-checked')
+      const [h] = await runHostRuleCheck([{ id: 'r', install: () => undefined, attempt: async () => { throw new Error(message) }, isRefusal: everything }])
+      expect(h!.status, message).toBe('not-checked')
+    }
+  })
+  it('the transactions check with /./ or a predicate treats real driver wording as not-checked', async () => {
+    for (const message of real) {
+      for (const refusal of [/./, (said: string) => said.length > 0]) {
+        for (const mode of ['off-at-start', 'null-after-start'] as const) {
+          const [f] = await runTransactionCheck({ mode, start: async () => ({ payload: await boot(`r5-${mode}`, mode === 'null-after-start') }), write: async () => { throw new Error(message) }, refusal })
+          expect(f!.status, `${mode} ${message}`).toBe('not-checked')
+        }
+      }
+      const [s] = await runTransactionCheck({ start: async () => { throw new Error(message) }, write: async () => undefined, refusal: /./ })
+      expect(s!.status, message).toBe('not-checked')
+    }
+  })
+  it('a driver message in a nested cause or errorResponse is a database error, under every path', async () => {
+    const nested = [
+      Object.assign(new Error('Could not save'), { cause: new Error(real[1]) }),
+      Object.assign(new Error('Could not save'), { cause: Object.assign(new Error('wrapped'), { cause: new Error(real[0]) }) }),
+      Object.assign(new Error('Could not save'), { errorResponse: { errmsg: real[2] } }),
+      Object.assign(new Error('Could not save'), { status: 403, cause: { message: 'operation was interrupted' } }),
+    ]
+    for (const e of nested) {
+      expect(isRefusal(e)).toBe(false)
+      const out = await runServerBackDoorCheck(fake([], () => Promise.reject(e)), col, { isRefusal: everything })
+      expect(statuses(out, (p) => !p.includes('bulk') && !p.includes('create'))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+      const [d] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: async () => { throw e } }], isRefusal: everything })
+      expect(d!.status).toBe('not-checked')
+      const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('r5-nested', false) }), write: async () => { throw e }, refusal: /./ })
+      expect(f!.status).toBe('not-checked')
+    }
+  })
+  it('a nested ordinary refusal still passes, and a very deep chain does not hang', async () => {
+    const ok = Object.assign(new Error('Members only'), { status: 403, cause: new Error('Use a replica set') })
+    expect(isRefusal(ok)).toBe(true)
+    let deep: Error = new Error(real[1])
+    for (let i = 0; i < 50; i++) deep = Object.assign(new Error('w'), { status: 403, cause: deep })
+    expect(isRefusal(deep)).toBe(true)
   })
 })

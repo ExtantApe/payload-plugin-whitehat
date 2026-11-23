@@ -63,10 +63,20 @@ export function isDatabaseError(error: unknown, depth = 0): boolean {
  * a message, so this is the last line of defense. The list is short on purpose: ordinary refusal text such as "Use a
  * replica set" or "You are not allowed to perform this action" must not match.
  */
-const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|\btransaction\b[^.\n]{0,60}\bhas been aborted|operation was interrupted|\bsession\b[^.\n]{0,60}\bwas killed|\bwrite conflict\b/i
+const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|\btransactions?\b[^.\n]{0,60}\bhas been aborted|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bsession\b[^.\n]{0,60}\bwas killed|\bwrite conflict\b/i
 /** Whether a message reads like the database's own session or transaction failure (see `DATABASE_MESSAGE`). */
 export function isDatabaseErrorMessage(message: string): boolean {
   return DATABASE_MESSAGE.test(message)
+}
+/** Whether the error's message, or the message of anything nested in `cause`, `errorResponse` or `errors` (bounded depth), is the database's own. */
+function databaseMessageIn(error: unknown, depth = 0): boolean {
+  if (error === null || error === undefined || depth > 6) return false
+  if (typeof error === 'string') return isDatabaseErrorMessage(error)
+  if (typeof error !== 'object') return false
+  const e = error as { message?: unknown; errmsg?: unknown; errorResponse?: unknown }
+  if (isDatabaseErrorMessage(messageOf(error)) || (typeof e.errmsg === 'string' && isDatabaseErrorMessage(e.errmsg))) return true
+  if (databaseMessageIn(e.errorResponse, depth + 1)) return true
+  return causesOf(error).some((c) => databaseMessageIn(c, depth + 1))
 }
 
 /**
@@ -76,7 +86,7 @@ export function isDatabaseErrorMessage(message: string): boolean {
  */
 function guardRefusal(custom: ((error: unknown) => boolean) | undefined): (error: unknown) => boolean {
   if (!custom) return isRefusal
-  return (error) => !isDatabaseError(error) && !isDatabaseErrorMessage(messageOf(error)) && custom(error)
+  return (error) => !isDatabaseError(error) && !databaseMessageIn(error) && custom(error)
 }
 
 /** A validation error: status 400 or 422, or the name ValidationError. A typo in a probe's data looks like this, so it says nothing about access. */
@@ -92,7 +102,7 @@ export function isValidationError(error: unknown): boolean {
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
-  if (isDatabaseError(error) || isDatabaseErrorMessage(messageOf(error)) || isValidationError(error)) return false
+  if (isDatabaseError(error) || databaseMessageIn(error) || isValidationError(error)) return false
   return REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))
 }
 const clip = (s: string, n = 100) => (s.length > n ? `${s.slice(0, n)}…` : s)
@@ -276,9 +286,7 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 // 2. Settings that look on but aren't: transactions
 // ---------------------------------------------------------------------------------------------------------
 
-/** Mongo's own complaints about transactions are not the plugin refusing. */
-const MONGO_TX_WORDS = /NoSuchTransaction|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|TransientTransactionError|WriteConflict|write conflict|in-progress transaction|has been aborted|multi-document transaction|retry your operation|Given transaction number/i
-const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.test(said) && !MONGO_TX_WORDS.test(said) && !isValidationError(error)
+const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.test(said) && !isDatabaseErrorMessage(said) && !isValidationError(error)
 
 /**
  * A plugin that relies on transactions must refuse to run without them. Payload starts without transactions
@@ -294,8 +302,8 @@ const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.tes
  *
  * `refusal` says what a proper refusal looks like; by default an error that mentions transactions but isn't
  * one of the database's own. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
- * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, never by
- * the message alone, and a database error is never a refusal, whatever `refusal` matches. A validation error is
+ * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, and by Mongo's
+ * own message words (also in a nested `cause` or `errorResponse`) when a wrapper kept only the text, and a database error is never a refusal, whatever `refusal` matches. A validation error is
  * not one by default. Any other error is "not checked".
  */
 export async function runTransactionCheck(input: {
@@ -310,7 +318,7 @@ export async function runTransactionCheck(input: {
   const mode = input.mode ?? 'off-at-start'
   const check = 'transactions-required'
   const title = mode === 'off-at-start' ? 'A plugin that needs transactions refuses to run without them' : 'A plugin that needs transactions refuses a write when beginTransaction answers null'
-  const refuses = (said: string, error: unknown) => !isDatabaseError(error) && !isDatabaseErrorMessage(said) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
+  const refuses = (said: string, error: unknown) => !isDatabaseError(error) && !isDatabaseErrorMessage(said) && !databaseMessageIn(error) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
   const role = 'server'
   let started: Awaited<ReturnType<typeof input.start>> | undefined
   let restore: (() => void) | undefined
