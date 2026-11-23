@@ -9,7 +9,7 @@ export { payloadReadPaths, type PayloadReadOptions } from './payload.js'
 export { formatReport } from './report.js'
 export { forgedCredentials, runCredentialCheck, type CredentialTarget, type Forgery, type TargetResponse } from './credentials.js'
 export { checkAdminExposure, checkClientSecrets, checkCookies, checkCors, checkGraphql, checkHeaders, checkOpenRedirects, checkUploads, scanUserContent, CONTENT_PATTERNS, SECRET_PATTERNS, type Answer, type Ask } from './checks.js'
-export { HOST_ANSWERS, isDatabaseError, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type DifferenceOperation, type HostAnswer, type HostAnswerName, type HostRuleOption, type ProtectedCollection } from './review.js'
+export { HOST_ANSWERS, isDatabaseError, isDatabaseErrorMessage, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type DifferenceOperation, type GoAheadName, type HostAnswer, type HostAnswerName, type HostRuleOption, type ProtectedCollection } from './review.js'
 export { lintDirectory, lintSource, stripComments } from './lint.js'
 export { fingerprint, recordFindings, retest, runSuite, whitehat, type Suite, type WhitehatOptions, type WriteSuite } from './alerts.js'
 

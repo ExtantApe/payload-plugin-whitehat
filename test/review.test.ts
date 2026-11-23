@@ -4,7 +4,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { BasePayload, buildConfig, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { HOST_ANSWERS, isDatabaseError, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
+import { HOST_ANSWERS, isDatabaseError, isDatabaseErrorMessage, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
 import { fixturePlugin, state } from './fixtures/fixturePlugin.js'
 import { closeAll } from './helpers/mongo.js'
 
@@ -143,7 +143,9 @@ describe('1. response-difference probe', () => {
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plain }] }))[0]!.status).toBe('not-checked')
     const half = async (who: Viewer) => { if (who.role === 'minor') throw new Error('crash'); throw Object.assign(new Error('No'), { status: 403 }) }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: half }] }))[0]!.status).toBe('not-checked')
-    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plain }], isRefusal: () => true }))[0]!.status).toBe('pass')
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plain }], isRefusal: () => true }))[0]!.status).toBe('not-checked')
+    const plainRefusal = async () => { throw new Error('Members only') }
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plainRefusal }], isRefusal: () => true }))[0]!.status).toBe('pass')
     expect((await runResponseDifferenceProbe({ identities: [minor, minor], operations: ops() }))[0]!.status).toBe('not-checked')
   })
 })
@@ -248,12 +250,13 @@ describe('3. server-code back doors', () => {
     expect(reached).toHaveLength(6)
     expect(reached.filter((f) => f.status !== 'not-checked')).toEqual([])
   })
-  it('is not-checked for a wrong collection slug, and passes a custom refusal', async () => {
+  it('is not-checked for a wrong collection slug, and a custom refusal can’t rescue a database error', async () => {
     const [f] = await runServerBackDoorCheck(payload, [{ ...target(false)[0]!, slug: 'no-such-collection' }])
     expect(f!.status).toBe('not-checked')
     state.crash = true
     const out = await runServerBackDoorCheck(payload, [{ ...target(false)[0]!, seed: seedThenCrash }], { isRefusal: (e) => isRefusal(e) || /NoSuchTransaction/.test(String((e as Error).message)) })
-    expect(out.filter((x) => x.path!.includes('-no-transaction')).map((x) => x.status)).toEqual(['pass', 'pass', 'pass'])
+    // The access rule refuses update and delete; the create reaches the hook, which dies with NoSuchTransaction. A custom pattern can't make that a refusal.
+    expect(out.filter((x) => x.path!.includes('-no-transaction')).map((x) => x.status)).toEqual(['pass', 'pass', 'not-checked'])
   })
   it('is not-checked when nothing matches the protected rows', async () => {
     const [f] = await runServerBackDoorCheck(payload, [{ ...target(false)[0]!, protectedWhere: { title: { equals: 'nothing like this' } } }])
@@ -323,14 +326,27 @@ describe('4. host rules that replace defaults', () => {
       const expected = ['empty-object', 'zero', 'empty-string', 'where', 'one', 'yes-string', 'empty-array', 'false', 'function']
       expect(names(await runHostRuleCheck([veto()]))).toEqual(expected)
     })
+    it('throws a config error for a goAhead that would turn the veto check off', async () => {
+      for (const bad of [['true'], ['throw'], ['null', 'empty-object'], ['zero'], ['where'], ['function']]) {
+        await expect(runHostRuleCheck([{ ...veto(), goAhead: bad as never }])).rejects.toThrow(/config error.*only null, undefined and false/)
+      }
+      await expect(runHostRuleCheck([{ ...veto(), goAhead: 'true' as never }])).rejects.toThrow(/config error/)
+      await expect(runHostRuleCheck([{ ...veto(), goAhead: true as never }])).rejects.toThrow(/config error/)
+      // Nothing ran before the error: no operation was tried and the option was not installed.
+      expect(state.host.vetoInvite).toBeUndefined()
+    })
+    it('accepts the three allowed goAhead answers, and an empty list', async () => {
+      await expect(runHostRuleCheck([{ ...veto(), goAhead: ['null', 'undefined', 'false'] }])).resolves.toBeTruthy()
+      await expect(runHostRuleCheck([{ ...veto(), goAhead: [] }])).resolves.toBeTruthy()
+    })
     it('fires when a falsy answer or a thrown veto lets the operation through', async () => {
       state.looseVeto = true
       expect(names(await runHostRuleCheck([veto()]))).toEqual(['zero', 'empty-string', 'throw', 'false'])
     })
     it('lets a plugin that documents another go-ahead answer say so, and says it', async () => {
       state.looseVeto = true
-      const out = await runHostRuleCheck([{ ...veto(), goAhead: ['null', 'undefined', 'false', 'zero', 'empty-string'] }])
-      expect(names(out)).toEqual(['throw'])
+      const out = await runHostRuleCheck([{ ...veto(), goAhead: ['null', 'undefined', 'false'] }])
+      expect(names(out)).toEqual(['zero', 'empty-string', 'throw'])
       expect(out.find((f) => f.path!.endsWith('false'))!.how).toMatch(/documented as go ahead/)
     })
   })
@@ -536,5 +552,79 @@ describe('review round 3', () => {
     expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.' }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
     expect(bulk(await runServerBackDoorCheck(fake([{ message: 'The following field is invalid: title', status: 400 }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
     expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.' }]), col, { isRefusal: (e) => /Members only/.test(String((e as Error).message)) }))).toEqual(['pass', 'pass', 'pass', 'pass'])
+  })
+})
+
+describe('review round 4: a custom isRefusal never turns a database error into a refusal', () => {
+  const everything = () => true
+  const matchesTransaction = (e: unknown) => /transaction|session|interrupted|conflict/i.test(String((e as Error)?.message))
+  /** What the driver says when a session is killed mid-update: plain text, no codeName. */
+  const killed = [
+    'Transaction 12 has been aborted.',
+    'operation was interrupted',
+    'Cannot use session 7 because the session was killed',
+    'Write conflict during plan execution',
+    'NoSuchTransaction: given transaction number 3 does not match',
+    'WriteConflict',
+  ]
+  const col = [{ slug: 'notes', identity: { role: 'owner', user: { id: 'u1' } } as unknown as Viewer, protectedWhere: {}, data: {}, holdsForServerCode: true, seed: async () => undefined }]
+  const denied = () => Promise.reject(Object.assign(new Error('No'), { status: 403 }))
+  /** A made-up payload whose bulk update and delete answer with `errors`, and whose single-document calls throw `single`. */
+  const fake = (errors: { message: string }[], single: () => Promise<unknown> = denied) =>
+    ({
+      find: async () => ({ docs: [{ id: 'row1' }] }),
+      findByID: async () => ({ id: 'row1' }),
+      update: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
+      delete: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
+      create: denied,
+    }) as unknown as Payload
+  const bulk = (fs: Finding[]) => fs.filter((f) => f.path!.includes('bulk')).map((f) => f.status)
+  const single = (fs: Finding[]) => fs.filter((f) => !f.path!.includes('bulk') && !f.path!.includes('create')).map((f) => f.status)
+
+  it('a killed-session bulk update with a custom regex isRefusal is not-checked, never "Refused"', async () => {
+    for (const message of killed) {
+      for (const isRefusalFn of [matchesTransaction, everything, (e: unknown) => /./.test(String((e as Error).message))]) {
+        const out = await runServerBackDoorCheck(fake([{ message }]), col, { isRefusal: isRefusalFn })
+        expect(bulk(out), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+        expect(out.filter((f) => f.status === 'pass' && /Refused/.test(f.how ?? '')).filter((f) => f.path!.includes('bulk'))).toEqual([])
+      }
+    }
+  })
+  it('a killed-session single-document write with a custom isRefusal is not-checked', async () => {
+    for (const message of killed) {
+      const out = await runServerBackDoorCheck(fake([], () => Promise.reject(new Error(message))), col, { isRefusal: everything })
+      expect(single(out), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+    }
+  })
+  it('a driver error with fields is not-checked under a custom isRefusal, with and without a plain message', async () => {
+    const e = Object.assign(new Error('Could not save'), { name: 'MongoServerError', codeName: 'WriteConflict', code: 112, errorLabels: ['TransientTransactionError'] })
+    const out = await runServerBackDoorCheck(fake([], () => Promise.reject(e)), col, { isRefusal: everything })
+    expect(single(out)).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+  })
+  it('ordinary refusal text still passes under a custom isRefusal', async () => {
+    const same = (e: unknown) => /Members only|replica set|not allowed/i.test(String((e as Error).message))
+    const out = await runServerBackDoorCheck(fake([{ message: 'Members only. Use a replica set to join.' }], () => Promise.reject(new Error('Members only.'))), col, { isRefusal: same })
+    expect(bulk(out)).toEqual(['pass', 'pass', 'pass', 'pass'])
+    expect(single(out)).toEqual(['pass', 'pass', 'pass', 'pass'])
+  })
+  it('the standard bulk message does not rescue an entry that also carries a database phrase', async () => {
+    const out = await runServerBackDoorCheck(fake([{ message: 'You are not allowed to perform this action. Transaction 4 has been aborted.' }]), col)
+    expect(bulk(out)).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+  })
+  it('the response-difference probe and the host-rule check also refuse to read a database error as a refusal', async () => {
+    const dbError = () => Object.assign(new Error('Transaction 9 has been aborted.'), { status: 403 })
+    const [d] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: async () => { throw dbError() } }], isRefusal: everything })
+    expect(d!.status).toBe('not-checked')
+    const [h] = await runHostRuleCheck([{ id: 'r', install: () => undefined, attempt: async () => { throw dbError() }, isRefusal: everything }])
+    expect(h!.status).toBe('not-checked')
+  })
+  it('the transactions check ignores a custom pattern for a message-only database error', async () => {
+    const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-msg', false) }), write: async () => { throw new Error('Transaction 9 has been aborted.') }, refusal: /transaction/i })
+    expect(f!.status).toBe('not-checked')
+  })
+  it('the message words are tight: ordinary refusal and setup text does not match', () => {
+    for (const m of killed) expect(isDatabaseErrorMessage(m), m).toBe(true)
+    for (const m of ['You are not allowed to perform this action.', 'Use a replica set', 'Transactions are required', 'Members only.', 'Forbidden', 'Your session has expired', 'The user was killed in the game']) expect(isDatabaseErrorMessage(m), m).toBe(false)
+    expect(isRefusal(Object.assign(new Error('Transaction 1 has been aborted.'), { status: 403 }))).toBe(false)
   })
 })

@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-23 (round 4): custom refusal predicates and the veto go-ahead list
+
+Suite: 93 tests before, 103 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
+
+- **Covered.** A custom `isRefusal` (a regex on "transaction", a predicate that accepts everything) never makes a database error a refusal: killed-session, aborted-transaction, interrupted-operation, write-conflict and NoSuchTransaction wording in bulk update and delete entries and in single-document errors; driver-shaped errors with fields; the response-difference probe, the host-rule check and the transactions check with the same message-only error; standard "not allowed" text next to a database phrase is not-checked; ordinary refusal text ("Members only", "Use a replica set") still passes under a custom predicate; the message words do not match unrelated text. `goAhead` rejects `true`, `throw`, `{}`, 0, where, function, a non-list and a mix, before any option runs; null, undefined, false and an empty list are accepted; a documented `false` is allowed by contract and says so. Eight of the ten new cases fail on the old code.
+- **Updated.** Two older tests expected a custom predicate to turn a NoSuchTransaction message into a pass; they now expect not-checked. The old `goAhead` test used `zero` and `empty-string`, which are no longer allowed.
+- **Skipped.** A real killed session mid-update on a live server (hard to trigger on demand; the bulk and single-document cases use payloads that answer with the driver's message text, and the real WriteConflict test from round 3 covers the fields).
+
 ## 2026-11-23 (round 3): fail-closed fixes
 
 Suite: 84 tests before, 93 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).

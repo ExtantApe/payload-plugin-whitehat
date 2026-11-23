@@ -58,6 +58,27 @@ export function isDatabaseError(error: unknown, depth = 0): boolean {
   return causesOf(error).some((c) => isDatabaseError(c, depth + 1))
 }
 
+/**
+ * Mongo's own words for a killed or aborted session or transaction. Bulk `errors` entries and wrapped errors carry only
+ * a message, so this is the last line of defense. The list is short on purpose: ordinary refusal text such as "Use a
+ * replica set" or "You are not allowed to perform this action" must not match.
+ */
+const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|\btransaction\b[^.\n]{0,60}\bhas been aborted|operation was interrupted|\bsession\b[^.\n]{0,60}\bwas killed|\bwrite conflict\b/i
+/** Whether a message reads like the database's own session or transaction failure (see `DATABASE_MESSAGE`). */
+export function isDatabaseErrorMessage(message: string): boolean {
+  return DATABASE_MESSAGE.test(message)
+}
+
+/**
+ * Wraps a caller's own `isRefusal` so a database or transaction error is never a refusal, whatever the caller's
+ * predicate says. The database test (error fields and Mongo's message words) runs first; the predicate only sees
+ * errors that pass it.
+ */
+function guardRefusal(custom: ((error: unknown) => boolean) | undefined): (error: unknown) => boolean {
+  if (!custom) return isRefusal
+  return (error) => !isDatabaseError(error) && !isDatabaseErrorMessage(messageOf(error)) && custom(error)
+}
+
 /** A validation error: status 400 or 422, or the name ValidationError. A typo in a probe's data looks like this, so it says nothing about access. */
 export function isValidationError(error: unknown): boolean {
   const e = error as { name?: unknown } | null
@@ -71,7 +92,7 @@ export function isValidationError(error: unknown): boolean {
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
-  if (isDatabaseError(error) || isValidationError(error)) return false
+  if (isDatabaseError(error) || isDatabaseErrorMessage(messageOf(error)) || isValidationError(error)) return false
   return REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))
 }
 const clip = (s: string, n = 100) => (s.length > n ? `${s.slice(0, n)}…` : s)
@@ -164,7 +185,7 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
   const out: Finding[] = []
   const pair = `${a?.role} vs ${b?.role}`
   if (!a || !b || a.role === b.role) return [note('response-difference', 'Responses don’t depend on who is asking', pair, 'Two identities with different roles are needed to compare answers.')]
-  const refusal = input.isRefusal ?? isRefusal
+  const refusal = guardRefusal(input.isRefusal)
   const own = (v: Viewer) => String((v.user as { id?: unknown } | null)?.id ?? '')
   const maskFor = (v: Viewer) => (text: string) => {
     let t = text
@@ -289,7 +310,7 @@ export async function runTransactionCheck(input: {
   const mode = input.mode ?? 'off-at-start'
   const check = 'transactions-required'
   const title = mode === 'off-at-start' ? 'A plugin that needs transactions refuses to run without them' : 'A plugin that needs transactions refuses a write when beginTransaction answers null'
-  const refuses = (said: string, error: unknown) => !isDatabaseError(error) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
+  const refuses = (said: string, error: unknown) => !isDatabaseError(error) && !isDatabaseErrorMessage(said) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
   const role = 'server'
   let started: Awaited<ReturnType<typeof input.start>> | undefined
   let restore: (() => void) | undefined
@@ -374,11 +395,14 @@ export type ProtectedCollection = {
  * Only a recognized refusal passes as a refusal (see `isRefusal`). Any other error, and any bulk error entry
  * that isn't one, are "not-checked". A bulk `errors` entry only has a message, so it counts as refused only
  * when `isRefusal` accepts it (a `status` or `name` on the entry) or its message is Payload's standard "not
- * allowed to perform this action" or says forbidden. Pass your own `isRefusal` for any other wording.
+ * allowed to perform this action" or says forbidden. Pass your own `isRefusal` for any other wording. Whatever you pass, a database or
+ * transaction error is never a refusal: it is tested first, by `codeName`, `code`, `errorLabels` and `cause`, and by
+ * Mongo's message words (NoSuchTransaction, WriteConflict, "Transaction ... has been aborted", "operation was
+ * interrupted", "session ... was killed"), which matters for a bulk entry that only has a message.
  */
 export async function runServerBackDoorCheck(payload: Payload, collections: ProtectedCollection[], options: { isRefusal?: (error: unknown) => boolean } = {}): Promise<Finding[]> {
   const out: Finding[] = []
-  const refusal = options.isRefusal ?? isRefusal
+  const refusal = guardRefusal(options.isRefusal)
   type Result = { docs?: unknown[]; errors?: { message?: string }[] }
   type Ran = { refused?: boolean; createdId?: string | number }
   for (const c of collections) {
@@ -389,7 +413,7 @@ export async function runServerBackDoorCheck(payload: Payload, collections: Prot
     const bulk = (r: unknown): Ran => {
       const res = r as Result
       const errors = res.errors ?? []
-      const other = errors.find((e) => !refusal(e) && !/not allowed to perform|forbidden/i.test(String(e?.message)))
+      const other = errors.find((e) => !refusal(e) && (isDatabaseErrorMessage(String(e?.message)) || !/not allowed to perform|forbidden/i.test(String(e?.message))))
       if (other) throw Object.assign(new Error(`bulk operation error: ${clip(messageOf(other), 80)}`), { crash: true })
       return { refused: (res.docs?.length ?? 0) === 0 && errors.length > 0 }
     }
@@ -511,6 +535,9 @@ export async function runServerBackDoorCheck(payload: Payload, collections: Prot
 // ---------------------------------------------------------------------------------------------------------
 
 export type HostAnswerName = 'true' | 'empty-object' | 'null' | 'zero' | 'empty-string' | 'throw' | 'where' | 'one' | 'yes-string' | 'empty-array' | 'false' | 'undefined' | 'function'
+/** The only answers a plugin may document as "go ahead" for a veto. */
+export type GoAheadName = 'null' | 'undefined' | 'false'
+const GO_AHEAD_NAMES: readonly string[] = ['null', 'undefined', 'false']
 export type HostAnswer = { name: HostAnswerName; value: unknown; throws?: boolean }
 export const HOST_ANSWERS: HostAnswer[] = [
   { name: 'true', value: true },
@@ -541,8 +568,12 @@ export type HostRuleOption = {
    * answer as "go ahead", say so in `goAhead`; the report then says that answer was allowed by contract.
    */
   kind?: 'access' | 'veto'
-  /** Veto options only. Answers that mean "no veto". Default `['null', 'undefined']`. */
-  goAhead?: HostAnswerName[]
+  /**
+   * Veto options only. Answers that mean "no veto". Default `['null', 'undefined']`. Only `null`, `undefined` and
+   * `false` may be listed; anything else (`true`, `throw`, `{}` ...) is a config error, since it would turn the
+   * strict veto check off.
+   */
+  goAhead?: GoAheadName[]
   /**
    * Installs the host's answer as that option's value: return the answer from the hook, or throw it when
    * `answer.throws`. Called with `undefined` first and last, for the plugin's own default.
@@ -563,15 +594,23 @@ export type HostRuleOption = {
 /**
  * Feeds each kind of host answer into a host-supplied rule and checks the plugin's defaults still hold. The
  * default outcome is measured first (`install(undefined)`). For `access` options, only the answers in `mayWiden`
- * may turn a refusal into an allow; for `veto` options, `true`, a reason string and a throw must refuse. An error that isn't a
- * recognized refusal (see `isRefusal`) is "not-checked", never a refusal.
+ * may turn a refusal into an allow. For `veto` options, every answer except those in `goAhead` (default null and
+ * undefined) must refuse: `true`, a reason string, `{}`, `[]`, 1, 0, an empty string, false, a function, a narrow
+ * where and a throw. `goAhead` takes only `null`, `undefined` and `false`; anything else throws a config error
+ * before any option runs. An error that isn't a recognized refusal (see `isRefusal`) is "not-checked", never a
+ * refusal, and a database error is never one whatever `isRefusal` says.
  */
 export async function runHostRuleCheck(options: HostRuleOption[]): Promise<Finding[]> {
+  for (const o of options) {
+    if (o.goAhead === undefined) continue
+    const bad = Array.isArray(o.goAhead) ? o.goAhead.filter((n) => !GO_AHEAD_NAMES.includes(n as string)).map(String) : [String(o.goAhead)]
+    if (bad.length > 0) throw new Error(`runHostRuleCheck config error: option "${o.id}" has goAhead ${Array.isArray(o.goAhead) ? `with ${bad.join(', ')}` : 'that is not a list'}; only null, undefined and false are allowed, because any other answer would turn the strict veto check off.`)
+  }
   const out: Finding[] = []
   for (const o of options) {
     const check = 'host-rule-replaces-default'
     const role = 'host'
-    const refusal = o.isRefusal ?? isRefusal
+    const refusal = guardRefusal(o.isRefusal)
     const attempt = async (): Promise<'allowed' | 'refused' | { crash: string }> => {
       try {
         await o.attempt()
