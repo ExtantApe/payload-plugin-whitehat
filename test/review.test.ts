@@ -1,9 +1,9 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
-import { buildConfig, getPayload, type Payload } from 'payload'
+import { BasePayload, buildConfig, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { HOST_ANSWERS, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
+import { HOST_ANSWERS, isRefusal, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
 import { fixturePlugin, state } from './fixtures/fixturePlugin.js'
 
 /** Real Payload 3.x on in-memory MongoDB, a made-up plugin, made-up users. Every instance and the database are removed at the end. */
@@ -19,13 +19,20 @@ const config = async (db: string, transactions: boolean) =>
     collections: [{ slug: 'users', auth: true, fields: [{ name: 'closed', type: 'checkbox' }, { name: 'minor', type: 'checkbox' }] }],
     plugins: [fixturePlugin()],
   })
+/** Boots an instance. One whose start-up throws is closed before the error goes on, so no connection is left open. */
 const boot = async (key: string, transactions: boolean) => {
-  const p = await getPayload({ config: await config(key, transactions), key })
+  const p = new BasePayload()
+  try {
+    await p.init({ config: await config(key, transactions) })
+  } catch (e) {
+    await p.destroy()
+    throw e
+  }
   booted.push(p)
   return p
 }
 const reset = () => {
-  state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = false
+  state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = state.looseVeto = state.crash = false
   state.host = {}
   state.transactions = 'ignored'
 }
@@ -108,9 +115,34 @@ describe('1. response-difference probe', () => {
     })
     expect(got.map((f) => [f.path, f.status])).toEqual([['status', 'fail'], ['shape', 'fail'], ['allowed', 'fail'], ['same', 'pass'], ['ids-only', 'pass']])
   })
-  it('reports not-checked for two server errors, and for identities that are the same role', async () => {
+  it('fires on a value-only difference: the same shape with 1 against 0, or true against false', async () => {
+    const bySide = (a: unknown, b: unknown) => async (who: Viewer) => (who.role === 'minor' ? a : b)
+    const got = await runResponseDifferenceProbe({
+      identities: [minor, closed],
+      operations: [
+        { id: 'count', title: 'c', run: bySide({ totalDocs: 1, docs: [] }, { totalDocs: 0, docs: [] }) },
+        { id: 'flag', title: 'f', run: bySide({ minor: true }, { minor: false }) },
+        { id: 'plain-number', title: 'n', run: bySide(1, 0) },
+        { id: 'same-values', title: 's', run: bySide({ totalDocs: 2 }, { totalDocs: 2 }) },
+      ],
+    })
+    expect(got.map((f) => [f.path, f.status])).toEqual([['count', 'fail'], ['flag', 'fail'], ['plain-number', 'fail'], ['same-values', 'pass']])
+    expect(got[0]!.how).toMatch(/values differ/)
+  })
+  it('fires when only what the caller can read afterwards differs by a count', async () => {
+    let n = 0
+    const [f] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'o', title: 'o', run: async (who) => void (who.role === 'minor' && n++), observe: async () => n }] })
+    expect(f).toMatchObject({ status: 'fail' })
+    expect(f!.how).toMatch(/Δ1 vs Δ0/)
+  })
+  it('reports not-checked when an answer is an error that isn’t a refusal, even the same crash for both', async () => {
     const boom = async () => { throw Object.assign(new Error('db down'), { status: 500 }) }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: boom }] }))[0]!.status).toBe('not-checked')
+    const plain = async () => { throw new Error('NoSuchTransaction') }
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plain }] }))[0]!.status).toBe('not-checked')
+    const half = async (who: Viewer) => { if (who.role === 'minor') throw new Error('crash'); throw Object.assign(new Error('No'), { status: 403 }) }
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: half }] }))[0]!.status).toBe('not-checked')
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plain }], isRefusal: () => true }))[0]!.status).toBe('pass')
     expect((await runResponseDifferenceProbe({ identities: [minor, minor], operations: ops() }))[0]!.status).toBe('not-checked')
   })
 })
@@ -144,6 +176,29 @@ describe('2. transactions that look on but are off', () => {
     const [f] = await runTransactionCheck({ start: async () => ({ payload }), write: async () => undefined })
     expect(f!.status).toBe('not-checked')
   })
+  it('after start-up: fires when beginTransaction answers null and the plugin only checked at start-up, or never', async () => {
+    const run = (mode: 'startup' | 'ignored' | 'write') => {
+      state.transactions = mode
+      return runTransactionCheck({ mode: 'null-after-start', start: async () => ({ payload }), write: async (p) => void (await p.delete({ collection: 'notes' as never, id: ((await p.create({ collection: 'notes' as never, data: { title: 'made up' } as never, overrideAccess: true })) as { id: string }).id, overrideAccess: true })) })
+    }
+    expect((await run('startup'))[0]).toMatchObject({ status: 'fail' })
+    expect((await run('ignored'))[0]).toMatchObject({ status: 'fail' })
+    expect((await run('write'))[0]).toMatchObject({ status: 'pass', path: 'write' })
+    const id = await payload.db.beginTransaction()
+    expect(id).toBeTruthy()
+    await payload.db.rollbackTransaction(id as never)
+  })
+  it('is not-checked when Mongo’s own transaction error is the only complaint, or beginTransaction throws', async () => {
+    for (const said of ['Transaction numbers are only allowed on a replica set member or mongos', 'NoSuchTransaction: transaction 1 aborted']) {
+      const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-mongo', false) }), write: async () => { throw new Error(said) } })
+      expect(f!.status).toBe('not-checked')
+    }
+    const fake = { db: { beginTransaction: async () => { throw new Error('boom') } } } as unknown as Payload
+    const stops: string[] = []
+    const out = await runTransactionCheck({ start: async () => ({ payload: fake, stop: async () => void stops.push('stopped') }), write: async () => undefined })
+    expect(out[0]).toMatchObject({ status: 'not-checked' })
+    expect(stops).toEqual(['stopped'])
+  })
   it('is not-checked when the refusal is for another reason', async () => {
     const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-other', false) }), write: async () => { throw new Error('field is invalid') } })
     expect(f!.status).toBe('not-checked')
@@ -155,27 +210,49 @@ describe('3. server-code back doors', () => {
     await payload.delete({ collection: 'notes' as never, where: { id: { exists: true } } as never, overrideAccess: true })
     await payload.create({ collection: 'notes' as never, data: { title: 'kept', owner: owner.id, locked: true } as never, overrideAccess: true })
   }
-  const target = (holdsForServerCode: boolean) => [{ slug: 'notes', identity: owner, protectedWhere: { locked: { equals: true } }, data: { title: 'changed' }, holdsForServerCode, seed }]
+  /** Seeds with the made-up database error switched off, and switches it back on for the probe. */
+  const seedThenCrash = async () => {
+    state.crash = false
+    await seed()
+    state.crash = true
+  }
+  const target = (holdsForServerCode: boolean) => [{ slug: 'notes', identity: owner, protectedWhere: { locked: { equals: true } }, data: { title: 'changed' }, create: { title: 'forbidden', owner: owner.id }, holdsForServerCode, seed }]
   const ids = (fs: Finding[]) => fs.filter((f) => f.status === 'fail').map((f) => f.path!.split(' · ')[1])
   afterAll(async () => void (await payload.delete({ collection: 'notes' as never, where: { id: { exists: true } } as never, overrideAccess: true })))
 
   it('stays quiet when the lock is in access and in hooks', async () => {
     const out = await runServerBackDoorCheck(payload, target(true))
-    expect(out).toHaveLength(6)
+    expect(out).toHaveLength(10)
     expect(bad(out)).toEqual([])
   })
   it('fires on bulk update and delete when bulk skips the lock', async () => {
     state.bulkHole = true
     expect(ids(await runServerBackDoorCheck(payload, target(false)))).toEqual(['bulk-update', 'bulk-delete'])
   })
-  it('fires on overrideAccess when the lock is only an access function, but only if the rule is meant to hold for server code', async () => {
+  it('fires on overrideAccess, a create, and bulk server code when the lock is only an access function, but only if the rule is meant to hold for server code', async () => {
     state.accessOnly = true
-    expect(ids(await runServerBackDoorCheck(payload, target(true)))).toEqual(['update-override-access', 'delete-override-access'])
+    expect(ids(await runServerBackDoorCheck(payload, target(true)))).toEqual(['update-override-access', 'delete-override-access', 'create-override-access', 'bulk-update-server-code', 'bulk-delete-server-code'])
     expect(ids(await runServerBackDoorCheck(payload, target(false)))).toEqual([])
   })
-  it('fires on disableTransaction when the hook needs a transaction to run', async () => {
+  it('fires on disableTransaction, create included, when the hook needs a transaction to run', async () => {
     state.txHole = true
-    expect(ids(await runServerBackDoorCheck(payload, target(false)))).toEqual(['update-no-transaction', 'delete-no-transaction'])
+    expect(ids(await runServerBackDoorCheck(payload, target(false)))).toEqual(['update-no-transaction', 'delete-no-transaction', 'create-no-transaction'])
+  })
+  it('is not-checked, never passed, when a probe dies with a database error', async () => {
+    state.crash = true
+    const out = await runServerBackDoorCheck(payload, [{ ...target(true)[0]!, seed: seedThenCrash }])
+    expect(out).toHaveLength(10)
+    // The probes that reach the guarded hooks crash; the ones the access rule already stops never get that far.
+    const reached = out.filter((f) => /create|override|server-code/.test(f.path!))
+    expect(reached).toHaveLength(6)
+    expect(reached.filter((f) => f.status !== 'not-checked')).toEqual([])
+  })
+  it('is not-checked for a wrong collection slug, and passes a custom refusal', async () => {
+    const [f] = await runServerBackDoorCheck(payload, [{ ...target(false)[0]!, slug: 'no-such-collection' }])
+    expect(f!.status).toBe('not-checked')
+    state.crash = true
+    const out = await runServerBackDoorCheck(payload, [{ ...target(false)[0]!, seed: seedThenCrash }], { isRefusal: (e) => isRefusal(e) || /NoSuchTransaction/.test(String((e as Error).message)) })
+    expect(out.filter((x) => x.path!.includes('-no-transaction')).map((x) => x.status)).toEqual(['pass', 'pass', 'pass'])
   })
   it('is not-checked when nothing matches the protected rows', async () => {
     const [f] = await runServerBackDoorCheck(payload, [{ ...target(false)[0]!, protectedWhere: { title: { equals: 'nothing like this' } } }])
@@ -195,21 +272,52 @@ describe('4. host rules that replace defaults', () => {
     ...extra,
   })
 
+  const names = (fs: Finding[]) => fs.filter((f) => f.status === 'fail').map((f) => f.path!.split(' · ')[1])
   it('stays quiet when only an exact true can open the default', async () => {
     const out = await runHostRuleCheck([option()])
     expect(out).toHaveLength(HOST_ANSWERS.length)
+    expect(HOST_ANSWERS.map((a) => a.name)).toEqual(expect.arrayContaining(['one', 'yes-string', 'empty-array', 'false', 'undefined', 'function']))
     expect(bad(out)).toEqual([])
     expect(out.find((f) => f.path!.endsWith('true'))!.how).toMatch(/allowed to widen/)
   })
   it('fires on every junk answer that a truthy test reads as yes, and on a throw read as yes', async () => {
     state.truthyHost = true
-    const failed = (await runHostRuleCheck([option()])).filter((f) => f.status === 'fail').map((f) => f.path!.split(' · ')[1])
-    expect(failed).toEqual(['empty-object', 'throw', 'where'])
+    expect(names(await runHostRuleCheck([option()]))).toEqual(['empty-object', 'throw', 'where', 'one', 'yes-string', 'empty-array', 'function'])
   })
   it('lets the option say a narrow where may widen', async () => {
     state.truthyHost = true
-    const failed = (await runHostRuleCheck([option({ mayWiden: ['true', 'where'] })])).filter((f) => f.status === 'fail').map((f) => f.path!.split(' · ')[1])
-    expect(failed).toEqual(['empty-object', 'throw'])
+    expect(names(await runHostRuleCheck([option({ mayWiden: ['true', 'where'] })]))).not.toContain('where')
+  })
+  it('is not-checked, never a refusal, when the attempt dies with a database error', async () => {
+    state.crash = true
+    const out = await runHostRuleCheck([option()])
+    expect(out).toHaveLength(1)
+    expect(out[0]).toMatchObject({ status: 'not-checked' })
+    expect(out[0]!.how).toMatch(/isn’t a refusal/)
+    state.crash = false
+    state.host.allowClosed = undefined
+    const inMiddle = await runHostRuleCheck([option({ attempt: async () => { if (state.host.allowClosed) throw new Error('NoSuchTransaction') ; throw Object.assign(new Error('No'), { status: 403 }) } })])
+    expect(inMiddle.filter((f) => f.status === 'pass')).toEqual([])
+  })
+  describe('veto mode', () => {
+    const veto = () => ({
+      id: 'vetoInvite',
+      kind: 'veto' as const,
+      install: (answer: HostAnswer | undefined) => {
+        state.host.vetoInvite = answer ? async () => { if (answer.throws) throw answer.value; return answer.value } : undefined
+      },
+      attempt: () => payload.create({ collection: 'invites' as never, data: { target: owner.id } as never, user: actor.user as never, overrideAccess: false }),
+      restore: async () => void (await payload.delete({ collection: 'invites' as never, where: { id: { exists: true } } as never, overrideAccess: true })),
+    })
+    it('stays quiet when an exact true and a throw veto, and null, 0 and the rest go ahead', async () => {
+      const out = await runHostRuleCheck([veto()])
+      expect(bad(out)).toEqual([])
+      expect(out.find((f) => f.path!.endsWith('null'))!.how).toMatch(/isn’t a veto/)
+    })
+    it('fires when a thrown veto lets the operation through', async () => {
+      state.looseVeto = true
+      expect(names(await runHostRuleCheck([veto()]))).toEqual(['throw'])
+    })
   })
   it('is not-checked when the default doesn’t restrict anything, and puts the host option back', async () => {
     state.host.allowClosed = async () => true

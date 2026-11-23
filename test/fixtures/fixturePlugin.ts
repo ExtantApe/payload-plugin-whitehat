@@ -17,6 +17,10 @@ export const state = {
   accessOnly: false,
   /** The lock hook only runs when a transaction exists (disableTransaction skips it). */
   txHole: false,
+  /** A veto answer counts when merely truthy, and a thrown veto means go ahead. */
+  looseVeto: false,
+  /** Every guarded write dies with a database error, as a transaction failure would. */
+  crash: false,
   /** Host hooks. */
   host: {} as { allowClosed?: (id: string) => unknown; vetoInvite?: (id: string) => unknown },
   /** How the plugin treats transactions being off: do nothing, refuse at start-up, or refuse writes. */
@@ -34,7 +38,7 @@ const notes: CollectionConfig = {
   ],
   access: {
     read: () => true,
-    create: ({ req }) => Boolean(req.user),
+    create: ({ req, data }) => Boolean(req.user) && !(state.accessOnly && (data as { title?: string } | undefined)?.title === 'forbidden'),
     update: ({ req, id }) => {
       if (!req.user) return false
       const mine = { owner: { equals: owner(req.user) } }
@@ -53,15 +57,21 @@ const notes: CollectionConfig = {
   hooks: {
     beforeChange: [
       async ({ data, originalDoc, req, operation }) => {
+        if (state.crash) throw new Error('NoSuchTransaction: transaction aborted')
         if (state.transactions === 'write' && (await req.transactionID) == null) throw new Error('This plugin needs database transactions, and they are off.')
-        if (state.accessOnly || state.bulkHole || operation !== 'update') return data
-        if (state.txHole && !req.transactionID) return data
+        if (state.accessOnly || (state.txHole && !req.transactionID)) return data
+        if (operation === 'create') {
+          if ((data as { title?: string } | undefined)?.title === 'forbidden') throw new Forbidden(req.t)
+          return data
+        }
+        if (state.bulkHole || operation !== 'update') return data
         if ((originalDoc as { locked?: boolean } | undefined)?.locked) throw new Forbidden(req.t)
         return data
       },
     ],
     beforeDelete: [
       async ({ req, id }) => {
+        if (state.crash) throw new Error('NoSuchTransaction: transaction aborted')
         if (state.accessOnly || state.bulkHole) return
         if (state.txHole && !req.transactionID) return
         const doc = (await req.payload.findByID({ collection: 'notes', id, depth: 0, overrideAccess: true, disableErrors: true })) as { locked?: boolean } | null
@@ -81,13 +91,15 @@ const invites: CollectionConfig = {
   hooks: {
     beforeValidate: [
       async ({ data, req }) => {
+        if (state.crash) throw new Error('NoSuchTransaction: transaction aborted')
         const target = String((data as { target?: unknown } | undefined)?.target ?? '')
         const log = (kind: string) => req.payload.create({ collection: 'invite-events', data: { kind }, overrideAccess: true })
         let vetoed = false
         try {
-          vetoed = (await state.host.vetoInvite?.(target)) === true
+          const answer = await state.host.vetoInvite?.(target)
+          vetoed = state.looseVeto ? Boolean(answer) : answer === true
         } catch {
-          vetoed = true
+          vetoed = !state.looseVeto
         }
         if (vetoed) {
           if (state.leakyEvents) await log('vetoed')

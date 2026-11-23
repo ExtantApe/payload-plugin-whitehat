@@ -30,8 +30,16 @@ describe('5. static lint', () => {
     expect(hits(hook("await req.payload.findByID({ collection: 'x', id, req })"))).toEqual([])
     expect(hits(hook("await req.payload.find({ collection: 'x', where: w })"))).toEqual([])
   })
-  it('ignores a find in a file with no hooks, and keeps line numbers across comments', () => {
-    expect(hits("await payload.find({ collection: 'x', req })")).toEqual([])
+  it('reads helper files with no hook names in them', () => {
+    expect(hits("export const first = (payload, req) => payload.find({ collection: 'x', req })")).toEqual(['paginated-find-in-transaction hook.ts:1'])
+  })
+  it('skips a find that follows another query in the same function, and flags one that follows a query in another function', () => {
+    const after = "export const h = async ({ req }) => {\n  await req.payload.findByID({ collection: 'a', id, req })\n  await req.payload.find({ collection: 'x', limit: 1, req })\n}"
+    expect(hits(after)).toEqual([])
+    const other = "const a = async (req) => {\n  await req.payload.findByID({ collection: 'a', id, req })\n}\nconst b = async (req) => {\n  await req.payload.find({ collection: 'x', req })\n}"
+    expect(hits(other)).toEqual(['paginated-find-in-transaction hook.ts:5'])
+  })
+  it('keeps line numbers across comments', () => {
     const s = stripComments('a\n/* one\ntwo */\nb // tail\nc')
     expect(s.split('\n')).toHaveLength(5)
     expect(s.split('\n')[3]!.trim()).toBe('b')

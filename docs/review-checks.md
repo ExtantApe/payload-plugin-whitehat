@@ -1,6 +1,8 @@
 # Review-finding checks
 
-Five checks for classes of bug that human security review keeps finding in Payload plugins. They are plain functions a plugin repo runs in its own Vitest suite or CI against a Payload instance. Like the rest of Whitehat they only look: nothing is fixed, findings carry a severity, and anything that couldn't be judged is `not-checked`, never `pass`. They use made-up users and records. Probes write on purpose, so run them on a throwaway database (the in-memory MongoDB the plugin's own tests use is the usual choice).
+Five checks for classes of bug that human security review keeps finding in Payload plugins. They are plain functions a plugin repo runs in its own Vitest suite or CI against a Payload instance. Like the rest of Whitehat they report and never fix, and findings carry a severity. The probes do write: they try to create, change and delete rows in the collections you name, and a probe that gets through leaves its change behind, so run them on a throwaway database with made-up users and records (the in-memory MongoDB the plugin's own tests use is the usual choice) and give them a `seed`.
+
+A probe counts something as refused only when it sees a recognized refusal: HTTP 400, 401, 403, 404 or 422, or Payload's Forbidden, UnauthorizedError, ValidationError or NotFound (`isRefusal`). Any other error, such as NoSuchTransaction, a database error or a wrong collection slug, is `not-checked`, and a check that cannot judge never reports a pass. Pass your own `isRefusal` where a site refuses some other way.
 
 ```ts
 import { runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, lintDirectory, formatReport } from '@extantape/payload-plugin-whitehat'
@@ -10,7 +12,7 @@ Turn findings into a test failure with `expect(findings.filter((f) => f.status !
 
 ## 1. `runResponseDifferenceProbe`
 
-Runs each operation as two identities that differ in one property, for example one refused by a host veto hook and one that simply isn't allowed. Flags any difference the caller can see: the refusal's message, the status, the returned shape, or what changed in the state `observe` reads (rows created, history, events). If the two answers differ, the answer is an oracle.
+Runs each operation as two identities that differ in one property, for example one refused by a host veto hook and one that simply isn't allowed. Flags any difference the caller can see: whether it was allowed, the refusal's message, the status, the shape and the values of what came back (a count of 1 against 0, a flag true against false), or what changed in the state `observe` reads (rows created, history, events). If the two answers differ, the answer is an oracle.
 
 ```ts
 await runResponseDifferenceProbe({
@@ -24,23 +26,29 @@ await runResponseDifferenceProbe({
 })
 ```
 
-Each identity's own user id, other ids, dates and long numbers are masked before comparing. Pass `mask` for anything else that is meant to differ. Run it for writes (create, update, invite-style) and for reads.
+Each identity's own user id, other ids, dates and long numbers are masked before comparing. Pass `mask` for anything else that is meant to differ. Run it for writes (create, update, invite-style) and for reads. If either identity gets an error that isn't a refusal, even the same crash for both, the operation is `not-checked`.
 
 ## 2. `runTransactionCheck`
 
-`start` boots the instance with transactions off (the Mongo adapter with `transactionOptions: false`, so `beginTransaction` answers null). The plugin must refuse to start, or `write` (a write the plugin protects with a transaction) must be refused. A write that goes through is the finding. A refusal means an error mentioning transactions, or whatever `refusal` matches. Any other error, or transactions that turn out to be on, is `not-checked`.
+Two modes. In the default `off-at-start` mode, `start` boots the instance with transactions off (the Mongo adapter with `transactionOptions: false`, so `beginTransaction` answers null). The plugin must refuse to start, or `write` (a write the plugin protects with a transaction) must be refused. A write that goes through is the finding.
+
+A start-up check can't see a per-request guard. With `mode: 'null-after-start'`, `start` boots a normal instance and the check makes `beginTransaction` answer null for the write only (and puts it back afterwards). A plugin that checked once at start-up, or that reads `req.transactionID` without awaiting it, passes start-up and fails here. Run both modes.
+
+A refusal is an error that mentions transactions, or whatever `refusal` matches (a pattern or a function of the message). Mongo's own NoSuchTransaction and "Transaction numbers are only allowed on a replica set member" are not refusals. Any other error, transactions that turn out to be on, or a `beginTransaction` that throws, is `not-checked`.
 
 ## 3. `runServerBackDoorCheck`
 
-For each protected collection (`slug`, the `identity` that must be refused, a `protectedWhere` that matches only protected rows, a guarded `data` change, and a `seed` that puts the rows back) it tries bulk update and bulk delete with a `where`, update and delete by id with `disableTransaction: true`, and, with `holdsForServerCode: true`, `overrideAccess: true`. Bulk operations answer with `{ docs, errors }` rather than throwing, so a rule that guards only single writes lets them through. Set `holdsForServerCode` only for rules meant to hold in hooks even when server code skips access.
+For each protected collection (`slug`, the `identity` that must be refused, a `protectedWhere` that matches only protected rows, a guarded `data` change, and a `seed` that puts the rows back) it tries bulk update and bulk delete with a `where`, update and delete by id with `disableTransaction: true`, and, if you give a `create` that must be refused, that create with `disableTransaction: true`. With `holdsForServerCode: true` it adds the same by id and create with `overrideAccess: true`, and bulk update and delete as server code (`overrideAccess: true`, no user), which catch a rule that commits one document at a time. Bulk operations answer with `{ docs, errors }` rather than throwing, so a rule that guards only single writes lets them through. Set `holdsForServerCode` only for rules meant to hold in hooks even when server code skips access. A bulk error that names the database is `not-checked`, not a refusal.
 
 ## 4. `runHostRuleCheck`
 
-For each host access or veto option: `install(answer)` sets the host's answer (`HOST_ANSWERS` are `true`, `{}`, null, 0, an empty string, a throw and a narrow where), and `attempt` does something the plugin's default refuses. With no host answer the attempt must be refused (otherwise `not-checked`). After that only answers in `mayWiden` (default `['true']`) may turn it into an allow. Everything else must keep the default. `install(undefined)` runs first and last, so the option is put back.
+For each host access or veto option: `install(answer)` sets the host's answer (`HOST_ANSWERS`: `true`, `{}`, null, 0, an empty string, a throw, a narrow where, 1, `'yes'`, `[]`, false, undefined and a function), and `attempt` does something the plugin's default refuses. With no host answer the attempt must be refused (otherwise `not-checked`). After that only answers in `mayWiden` (default `['true']`) may turn it into an allow. Everything else must keep the default. `install(undefined)` runs first and last, so the option is put back.
+
+For a veto hook, set `kind: 'veto'`. Null means go ahead there, so the rule is different: `attempt` is something the default allows, an exact `true` must refuse it, and so must a throw (a broken veto fails closed). The other answers may allow or refuse, since they aren't vetoes; only a crash is flagged.
 
 ## 5. `lintDirectory` and `lintSource`
 
-A heuristic read of source text (never an edit). It flags a host hook's answer used as a truth value instead of `=== true`, and a paginated `payload.find` passing `req` in a file with hooks and no `pagination: false`. Each hit names `file:line`. A hit says look here; a clean run isn't proof.
+A heuristic read of source text (never an edit) of every source file, helpers included. It flags a host hook's answer used as a truth value instead of `=== true`, and a paginated `payload.find` passing `req`, without `pagination: false`, as the first query of its function. A find that follows another query in the same function is skipped. Each hit names `file:line`. Limits: it can't see whether a transaction is open or what calls the function, it doesn't follow calls into other functions, and it misses a host hook held under another name. A hit says look here; a clean run isn't proof.
 
 ```ts
 it('has no known review-finding patterns', () => {
