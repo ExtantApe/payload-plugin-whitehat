@@ -880,7 +880,7 @@ describe('round 9: walk limits, APIError status, driver text, more fields, throw
     expect((await run(() => Object.assign(chain(driver(), 3), { status: 403, message: refusalText })))[0]!.status).toBe('not-checked')
     // A cycle is a finished walk, so a plain refusal in a cycle still passes.
     const a = Object.assign(new Error(refusalText), { status: 403 }) as Error & { cause?: unknown }
-    a.cause = Object.assign(new Error('b'), { cause: a })
+    a.cause = Object.assign(new Error(refusalText), { cause: a })
     expect((await run(() => a))[0]!.status).toBe('pass')
   })
   it('2: an APIError is a refusal only with a 4xx status', async () => {
@@ -889,7 +889,7 @@ describe('round 9: walk limits, APIError status, driver text, more fields, throw
       if (status === undefined) delete (e as { status?: number }).status
       expect((await run(() => e))[0]!.status, String(status)).toBe('not-checked')
     }
-    for (const status of [401, 403, 404, 409, 429]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('pass')
+    for (const status of [401, 403, 404]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('pass')
     // 400 is a validation error whatever the class.
     expect((await run(() => new APIError(refusalText, 400)))[0]!.status).toBe('not-checked')
   })
@@ -952,6 +952,95 @@ describe('round 9: walk limits, APIError status, driver text, more fields, throw
     }
     const [r] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'g', title: 'g', run: async () => { throw msg } }] })
     expect(r!.status).toBe('not-checked')
+  })
+})
+
+describe('round 10: driver text under a refusal, containers, APIError band, hostile status', () => {
+  const refusalText = 'This plugin needs transactions, and they are off.'
+  const run = (make: () => unknown, mode: 'start' | 'write' = 'start', refusal?: RegExp) =>
+    runTransactionCheck({
+      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r10', false) }),
+      write: async () => { throw make() },
+      refusal,
+    })
+  const driver = () => Object.assign(new Error('x'), { name: 'MongoServerError', codeName: 'WriteConflict' })
+  const wrap = (extra: Record<string, unknown>, status = 403) => Object.assign(new Error(refusalText), { status }, extra)
+
+  it('1: any nested message that is not refusal-shaped makes a refusal wrapper not-checked', async () => {
+    const texts = [
+      'connection pool for host-a was cleared', 'MongoNetworkError: socket closed', 'not primary', 'Transaction failed', 'server selection timed out after 30000 ms',
+      'E11000 duplicate key error collection', 'The operation was aborted by the server', 'Unable to roll back the changes', 'Topology was destroyed',
+      'cursor id 4 not found', 'Executor error during find command', 'Lock acquisition failed',
+    ]
+    for (const t of texts) {
+      for (const key of ['cause', 'originalError', 'reason']) {
+        expect((await run(() => wrap({ [key]: new Error(t) })))[0]!.status, `${key}: ${t}`).toBe('not-checked')
+        expect((await run(() => new APIError(refusalText, 403, { [key]: new Error(t) })))[0]!.status, `api ${key}: ${t}`).toBe('not-checked')
+      }
+      expect((await run(() => wrap({ errors: [{ message: t }] }), 'write'))[0]!.status, t).toBe('not-checked')
+    }
+    // A nested message that is itself a refusal keeps the pass.
+    expect((await run(() => wrap({ cause: new Error('This plugin requires transactions.') })))[0]!.status).toBe('pass')
+  })
+  it('2: containers are walked: Map, Set, keyed object, array-like, nested array, reason, response, extensions.exception, errInfo.details', async () => {
+    const d = driver()
+    const holders: Record<string, Record<string, unknown>> = {
+      map: { errors: new Map([['a', d]]) },
+      mapKey: { errors: new Map([[d, 'x']]) },
+      set: { errors: new Set([d]) },
+      keyed: { errors: { first: d } },
+      arrayLike: { errors: { length: 1, 0: d } },
+      nested: { errors: [[[d]]] },
+      nestedMap: { errors: [new Map([['a', [d]]])] },
+      reason: { reason: d },
+      response: { response: { errors: [d] } },
+      exception: { extensions: { exception: d } },
+      details: { errInfo: { details: d } },
+    }
+    for (const [name, h] of Object.entries(holders)) {
+      const e = wrap(h)
+      expect(isDatabaseError(e), name).toBe(true)
+      expect(isTransactionError(e), name).toBe(true)
+      expect(isRefusal(e), name).toBe(false)
+      expect((await run(() => e))[0]!.status, name).toBe('not-checked')
+      expect((await run(() => e, 'write', /./))[0]!.status, name).toBe('not-checked')
+    }
+    // Driver text in a container is found by message too.
+    for (const errors of [new Map([['a', 'Cannot call abortTransaction twice']]), new Set([{ message: 'write conflict' }]), { k: { message: 'No transaction started' } }]) expect(isRefusal(wrap({ errors })), String(errors)).toBe(false)
+    // A cycle through a Map still ends.
+    const m = new Map<string, unknown>()
+    const e = wrap({ errors: m })
+    m.set('self', e)
+    expect(isRefusal(e)).toBe(true)
+  })
+  it('3: an APIError is a refusal only with an integer 401, 403 or 404', async () => {
+    for (const status of [408, 409, 429, 499, 403.5, 402, 410, 451]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('not-checked')
+    for (const status of [401, 403, 404]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('pass')
+    expect((await run(() => Object.assign(new Error(refusalText), { status: 403.5 })))[0]!.status).toBe('not-checked')
+  })
+  it('4: a throwing status getter, and reads of each property once, never crash the difference probe', async () => {
+    const boom = () => { throw new Error('getter exploded') }
+    const e = Object.defineProperty(new Error('nope'), 'status', { get: boom })
+    const [r] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'g', title: 'g', run: async (who) => { if (who === minor) throw e; return 1 } }] })
+    expect(r!.status).not.toBe('pass')
+    // role, user id, id and title are read once each.
+    const reads: Record<string, number> = {}
+    const counted = <T extends object>(name: string, o: T, keys: string[]): T => {
+      for (const k of keys) {
+        const v = (o as Record<string, unknown>)[k]
+        Object.defineProperty(o, k, { get: () => { reads[`${name}.${k}`] = (reads[`${name}.${k}`] ?? 0) + 1; return v } })
+      }
+      return o
+    }
+    const user = counted('user', { id: 'u1' }, ['id'])
+    const a = counted('a', { role: 'x', user } as Viewer, ['role', 'user'])
+    const b = counted('b', { role: 'y', user: { id: 'u2' } } as Viewer, ['role'])
+    const op = counted('op', { id: 'p', title: 't', run: async () => 1 } as { id: string; title: string; run: () => Promise<number> }, ['id', 'title'])
+    await runResponseDifferenceProbe({ identities: [a, b], operations: [op] })
+    for (const [k, n] of Object.entries(reads)) expect(n, k).toBe(1)
+    // A viewer whose role throws is not-checked.
+    const hostile = Object.defineProperty({ user: null }, 'role', { get: boom }) as unknown as Viewer
+    expect((await runResponseDifferenceProbe({ identities: [hostile, closed], operations: [{ id: 'g', title: 'g', run: async () => 1 }] }))[0]!.status).toBe('not-checked')
   })
 })
 

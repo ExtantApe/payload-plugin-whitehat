@@ -14,7 +14,15 @@ import type { Finding, Severity, Viewer } from './index.js'
  * that works leaves the change behind. Run them on a throwaway database, and give the checks a `seed` or clean up.
  */
 
-const statusOf = (e: unknown): number => Number((e as { status?: unknown })?.status ?? (e as { statusCode?: unknown })?.statusCode ?? NaN)
+/** The HTTP status of an error, or NaN. Never throws: a getter that throws reads as NaN. */
+const statusOf = (e: unknown): number => {
+  try {
+    const o = e as { status?: unknown; statusCode?: unknown } | null | undefined
+    return Number(o?.status ?? o?.statusCode ?? NaN)
+  } catch {
+    return NaN
+  }
+}
 
 /** Statuses and error names that mean "the system said no": sign-in, forbidden and not found. Validation is not one. */
 const REFUSAL_STATUSES = [401, 403, 404]
@@ -24,16 +32,78 @@ const TX_CODES = [72, 112, 117, 225, 244, 251, 256, 263, 290]
 const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult']
 
 /** Where an error can nest another one: GraphQL, the driver's server reply and bulk write errors, among others. */
-const NESTED_KEYS = ['cause', 'originalError', 'errorResponse', 'errors', 'writeErrors', 'writeConcernError', 'errInfo', 'extensions', 'result', 'err'] as const
+const NESTED_KEYS = ['cause', 'originalError', 'errorResponse', 'errors', 'writeErrors', 'writeConcernError', 'errInfo', 'extensions', 'result', 'err', 'reason', 'response', 'exception', 'details'] as const
 
 /** What the walk reads from one error, taken once and safely: a property that throws marks the snapshot unreadable. */
-type Snap = { name: unknown; code: unknown; codeName: unknown; errmsg: unknown; labels: string[]; status: number; text: string; children: unknown[]; unreadable: boolean }
+type Snap = { name: unknown; code: unknown; codeName: unknown; errmsg: unknown; labels: string[]; status: number; text: string; own: string | null; children: unknown[]; unreadable: boolean }
+
+const MAX_CONTAINER = 10_000
+const isPlainObject = (v: object): boolean => {
+  const p = Object.getPrototypeOf(v)
+  return p === Object.prototype || p === null
+}
+/**
+ * Pushes what a container holds: an array or nested array, a Map's values, a Set's members, an array-like object
+ * (`{ length: 2, 0: e, 1: e }`) or a keyed object (`{ first: e }`). Returns false if it could not read all of it.
+ */
+function spread(v: unknown, out: unknown[], depth = 0): boolean {
+  if (v === undefined || v === null) return true
+  if (typeof v !== 'object') {
+    out.push(v)
+    return true
+  }
+  if (depth > 4) {
+    out.push(v)
+    return true
+  }
+  let ok = true
+  const add = (x: unknown) => {
+    if (x !== null && typeof x === 'object' && (Array.isArray(x) || x instanceof Map || x instanceof Set)) ok = spread(x, out, depth + 1) && ok
+    else out.push(x)
+  }
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length; i++) add(v[i])
+    return ok
+  }
+  if (v instanceof Map) {
+    for (const [k, x] of v) {
+      add(x)
+      if (k !== null && typeof k === 'object') add(k)
+    }
+    return ok
+  }
+  if (v instanceof Set) {
+    for (const x of v) add(x)
+    return ok
+  }
+  out.push(v)
+  if (isPlainObject(v)) {
+    const len = (v as { length?: unknown }).length
+    if (typeof len === 'number' && Number.isInteger(len) && len >= 0) {
+      if (len > MAX_CONTAINER) return false
+      for (let i = 0; i < len; i++) add((v as Record<number, unknown>)[i])
+    }
+    const keys = Object.keys(v)
+    if (keys.length > MAX_CONTAINER) return false
+    for (const k of keys) add((v as Record<string, unknown>)[k])
+  }
+  return ok
+}
 
 /** Reads each property inside try/catch (a getter can throw), so a hostile error cannot crash a check. A throw means "unreadable". */
 function snapshot(node: unknown): Snap {
-  const snap: Snap = { name: undefined, code: undefined, codeName: undefined, errmsg: undefined, labels: [], status: NaN, text: '', children: [], unreadable: false }
+  const snap: Snap = { name: undefined, code: undefined, codeName: undefined, errmsg: undefined, labels: [], status: NaN, text: '', own: null, children: [], unreadable: false }
   if (typeof node === 'string') {
     snap.text = node
+    snap.own = node
+    return snap
+  }
+  if (Array.isArray(node) || node instanceof Map || node instanceof Set) {
+    try {
+      if (!spread(node, snap.children)) snap.unreadable = true
+    } catch {
+      snap.unreadable = true
+    }
     return snap
   }
   const o = node as Record<string, unknown>
@@ -56,6 +126,7 @@ function snapshot(node: unknown): Snap {
     snap.labels = Array.isArray(l) ? l.map(String) : l instanceof Set ? [...l].map(String) : []
     const message = get('message')
     snap.text = String(message ?? node)
+    if (typeof message === 'string') snap.own = message
     const d = get('data')
     if (d !== undefined && d !== null) {
       try {
@@ -67,12 +138,12 @@ function snapshot(node: unknown): Snap {
   } catch {
     snap.unreadable = true
   }
+  if (snap.own === null && typeof snap.errmsg === 'string') snap.own = snap.errmsg
   for (const k of NESTED_KEYS) {
     const v = get(k)
     if (v === undefined || v === null) continue
     try {
-      if (Array.isArray(v)) for (let i = 0; i < v.length; i++) snap.children.push(v[i])
-      else snap.children.push(v)
+      if (!spread(v, snap.children)) snap.unreadable = true
     } catch {
       snap.unreadable = true
     }
@@ -88,7 +159,7 @@ const walkable = (n: unknown): n is object | string => n !== null && n !== undef
  * `incomplete` is true when the walk could not finish: the depth limit was reached with nodes still unvisited, or a
  * property on some node threw. Callers that guard against a database error must then treat the answer as unknown.
  */
-function walk(error: unknown, test: (snap: Snap) => boolean): { hit: boolean; incomplete: boolean } {
+function walk(error: unknown, test: (snap: Snap, depth: number) => boolean): { hit: boolean; incomplete: boolean } {
   const seen = new WeakSet<object>()
   let level: unknown[] = [error]
   let incomplete = false
@@ -102,7 +173,7 @@ function walk(error: unknown, test: (snap: Snap) => boolean): { hit: boolean; in
       }
       const snap = snapshot(node)
       if (snap.unreadable) incomplete = true
-      if (test(snap)) return { hit: true, incomplete }
+      if (test(snap, depth)) return { hit: true, incomplete }
       for (const c of snap.children) next.push(c)
     }
     level = next
@@ -292,13 +363,23 @@ const delta = (before: unknown, after: unknown): string => {
 export async function runResponseDifferenceProbe(input: { identities: [Viewer, Viewer]; operations: DifferenceOperation[]; mask?: (text: string) => string; isRefusal?: (error: unknown) => boolean }): Promise<Finding[]> {
   const [a, b] = input.identities
   const out: Finding[] = []
-  const pair = `${a?.role} vs ${b?.role}`
-  if (!a || !b || a.role === b.role) return [note('response-difference', 'Responses don’t depend on who is asking', pair, 'Two identities with different roles are needed to compare answers.')]
+  // Each property is read once, guarded: a getter that throws or changes its answer cannot crash or skew the probe.
+  const read = <T,>(f: () => T): T | undefined => {
+    try {
+      return f()
+    } catch {
+      return undefined
+    }
+  }
+  const roleA = read(() => a?.role)
+  const roleB = read(() => b?.role)
+  const pair = `${roleA} vs ${roleB}`
+  if (!a || !b || roleA === undefined || roleB === undefined || roleA === roleB) return [note('response-difference', 'Responses don’t depend on who is asking', pair, 'Two identities with different roles are needed to compare answers.')]
   const refusal = guardRefusal(input.isRefusal)
-  const own = (v: Viewer) => String((v.user as { id?: unknown } | null)?.id ?? '')
+  const ids = new Map<Viewer, string>([[a, read(() => String((a.user as { id?: unknown } | null)?.id ?? '')) ?? ''], [b, read(() => String((b.user as { id?: unknown } | null)?.id ?? '')) ?? '']])
   const maskFor = (v: Viewer) => (text: string) => {
     let t = text
-    const id = own(v)
+    const id = ids.get(v) ?? ''
     if (id.length >= 3) t = t.split(id).join('<id>')
     t = t.replace(IDS, '<x>')
     // A short id would also match inside other words and numbers, so it only counts as a whole token.
@@ -306,8 +387,13 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
     return input.mask ? input.mask(t) : t
   }
   for (const op of input.operations) {
-    const severity = op.severity ?? 'high'
-    const title = `${op.title}: both identities get the same answer`
+    const opId = read(() => op.id) as string
+    const opTitle = read(() => op.title)
+    const severity = read(() => op.severity) ?? 'high'
+    const opReproduce = read(() => op.reproduce)
+    const opObserve = read(() => op.observe)
+    const opRun = read(() => op.run)
+    const title = `${opTitle}: both identities get the same answer`
     const outcomes: Outcome[] = []
     let broken: string | null = null
     for (const who of [a, b]) {
@@ -315,29 +401,30 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
       let before: unknown
       let after: unknown
       try {
-        before = op.observe ? await op.observe(who) : undefined
+        before = opObserve ? await opObserve.call(op, who) : undefined
       } catch (e) {
         broken = `observe failed: ${clip(messageOf(e), 80)}`
         break
       }
       let o: Outcome
       try {
-        const res = await op.run(who)
+        const res = await opRun!.call(op, who)
         o = { threw: false, refused: false, status: null, message: '', shape: mask(shapeOf(res)), value: mask(json(res)), observed: '' }
       } catch (e) {
-        o = { threw: true, refused: refusal(e), status: Number.isFinite(statusOf(e)) ? statusOf(e) : null, message: mask(messageOf(e)), shape: '', value: '', observed: '' }
+        const status = statusOf(e)
+        o = { threw: true, refused: refusal(e), status: Number.isFinite(status) ? status : null, message: mask(messageOf(e)), shape: '', value: '', observed: '' }
       }
       try {
-        after = op.observe ? await op.observe(who) : undefined
+        after = opObserve ? await opObserve.call(op, who) : undefined
       } catch (e) {
         broken = `observe failed: ${clip(messageOf(e), 80)}`
         break
       }
-      o.observed = op.observe ? mask(delta(before, after)) : ''
+      o.observed = opObserve ? mask(delta(before, after)) : ''
       outcomes.push(o)
     }
     if (broken || outcomes.length < 2) {
-      out.push(note('response-difference', title, pair, broken ?? 'The probe could not run.', op.id, severity))
+      out.push(note('response-difference', title, pair, broken ?? 'The probe could not run.', opId, severity))
       continue
     }
     const [x, y] = outcomes as [Outcome, Outcome]
@@ -350,14 +437,14 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
         severity,
         status: 'fail',
         role: pair,
-        path: op.id,
+        path: opId,
         how: `One identity was allowed and the other got an error that isn’t a refusal (${clip(crashed.message, 80)}). A caller can see that difference.`,
-        reproduce: op.reproduce ?? 'Run the operation once as each identity and compare the two answers.',
+        reproduce: opReproduce ?? 'Run the operation once as each identity and compare the two answers.',
       })
       continue
     }
     if (crashed) {
-      out.push(note('response-difference', title, pair, `An answer was an error that isn’t a refusal (${clip(crashed.message, 80)}), so it says nothing about access.`, op.id, severity))
+      out.push(note('response-difference', title, pair, `An answer was an error that isn’t a refusal (${clip(crashed.message, 80)}), so it says nothing about access.`, opId, severity))
       continue
     }
     const diffs: string[] = []
@@ -373,9 +460,9 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
       severity,
       status: diffs.length ? 'fail' : 'pass',
       role: pair,
-      path: op.id,
+      path: opId,
       how: diffs.length ? `The answer depends on the identity: ${diffs.join('; ')}.` : 'Both identities got the same status, message, shape, values and readable result.',
-      reproduce: diffs.length ? (op.reproduce ?? 'Run the operation once as each identity and compare the two answers.') : undefined,
+      reproduce: diffs.length ? (opReproduce ?? 'Run the operation once as each identity and compare the two answers.') : undefined,
     })
   }
   return out
@@ -387,6 +474,16 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 
 /** Words a plugin uses when it says no on purpose, as opposed to a transaction fault that merely mentions the word. */
 const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't|cannot|can't|unable|not (?:available|enabled|supported|allowed)|disabled|off|without|replica set)\b/i
+const refusalText = (said: string): boolean => /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said)
+/**
+ * Under a refusal wrapper, every message nested inside it must itself read as a refusal. A driver text is too varied
+ * to list, so anything nested that is not refusal-shaped means the wrapper may be hiding a fault: not a refusal.
+ * An unfinished walk is unknown, so also not a refusal.
+ */
+const nestedMessagesRefuse = (error: unknown): boolean => {
+  const r = walk(error, (n, depth) => depth > 0 && n.own !== null && n.own !== '' && !refusalText(n.own))
+  return !r.hit && !r.incomplete
+}
 /**
  * By default a refusal comes from the plugin saying no: an error with a refusal status (401, 403, 404) or name, or a
  * Payload `APIError` with a 4xx status (a 400 or 422 is a validation error and never counts), that mentions transactions and says no on purpose. A bare message from a plain Error is not
@@ -395,9 +492,10 @@ const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't
 const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
   const status = statusOf(error)
   // A Payload APIError says no only with a 4xx status. Its default status is 500 and a bare one has none: neither is a refusal.
-  const apiRefusal = String((error as { name?: unknown })?.name) === 'APIError' && status >= 400 && status < 500
-  const refusalShaped = REFUSAL_STATUSES.includes(status) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name)) || apiRefusal
-  return refusalShaped && /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said) && !isValidationError(error)
+  // Only a whole 401, 403 or 404 counts (not 408, 409, 429, 499 or 403.5), whatever the class.
+  const name = String((error as { name?: unknown })?.name)
+  const refusalShaped = REFUSAL_STATUSES.includes(status) || REFUSAL_NAMES.includes(name)
+  return refusalShaped && refusalText(said) && !isValidationError(error) && nestedMessagesRefuse(error)
 }
 
 /**

@@ -2,6 +2,13 @@
 
 Newest first.
 
+## 2026-11-24 (round 10): driver text under a refusal, containers, APIError band, hostile status
+
+Suite: 128 tests before, 132 after (`npx vitest run`; real Payload 3.92 and in-memory MongoDB).
+
+- **Covered.** Twelve made-up driver texts nested under a 403 or an `APIError` 403 (in `cause`, `originalError`, `reason`, `errors`) are not-checked; a nested refusal message still passes. Driver errors inside a Map (value and key), Set, keyed object, array-like, nested arrays, `reason`, `response`, `extensions.exception` and `errInfo.details` are found, and a cycle through a Map ends. APIError at 402, 408, 409, 410, 429, 451, 499 and 403.5 is not-checked; 401, 403 and 404 pass. A throwing `status` getter and a throwing `role` do not crash the difference probe, and role, user id, operation id and title are each read once. All four new cases fail on the old code.
+- **Skipped.** Real driver errors on a live server: shaped made-up errors cover the walk, and the live WriteConflict case from earlier rounds still runs.
+
 ## 2026-11-23 (round 9): walk limits, APIError status, more driver text, hostile properties
 
 Suite: 123 tests before, 128 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
