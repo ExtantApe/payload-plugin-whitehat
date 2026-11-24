@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-23 (refusal rule): bare messages, structural driver text, nested errors
+
+Suite: 116 tests before, 123 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
+
+- **Covered.** A long made-up TransactionTooOld text (lsid, txnNumber), "Cannot call abortTransaction twice", the primary read preference text, the timeoutMS withTransaction text, ClientSession, committed, lifetime and ended-session wording are never a refusal by default or under `/transaction|session/`, with or without a 403, in both modes. Codes 72 and 117 (with and without a `codeName`, and as an `errmsg` reply) are database errors. A bare plain-Error message is not-checked by default; a 403, an APIError or the caller's own pattern make "has transactions off" a refusal. `originalError` is walked. An `errors` array of 250,000 entries finishes and a database entry at its end is found. All seven new cases fail on the old code.
+- **Updated.** The fixture plugin and two older tests now refuse with a 403, since a bare message no longer counts.
+- **Skipped.** Real driver errors for codes 72, 117 and 225 on a live server (not triggerable on demand).
+
 ## 2026-11-23 (round 6): driver wording, strict default refusal, cycles
 
 Suite: 109 tests before, 116 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).

@@ -62,7 +62,7 @@ const notes: CollectionConfig = {
     beforeChange: [
       async ({ data, originalDoc, req, operation }) => {
         if (state.crash) throw new Error('NoSuchTransaction: transaction aborted')
-        if (state.transactions === 'write' && (await req.transactionID) == null) throw new Error('This plugin needs database transactions, and they are off.')
+        if (state.transactions === 'write' && (await req.transactionID) == null) throw new APIError('This plugin needs database transactions, and they are off.', 403)
         if (state.accessOnly || (state.txHole && !req.transactionID)) return data
         if (operation === 'create') {
           if ((data as { title?: string } | undefined)?.title === 'forbidden') throw new Forbidden(req.t)
@@ -134,6 +134,6 @@ export const fixturePlugin =
     collections: [...(config.collections ?? []), notes, events, invites],
     onInit: async (payload: Payload) => {
       await config.onInit?.(payload)
-      if (state.transactions === 'startup' && (await (payload.db as { beginTransaction: () => Promise<unknown> }).beginTransaction()) == null) throw new Error('This plugin needs database transactions, and they are off.')
+      if (state.transactions === 'startup' && (await (payload.db as { beginTransaction: () => Promise<unknown> }).beginTransaction()) == null) throw new APIError('This plugin needs database transactions, and they are off.', 403)
     },
   })

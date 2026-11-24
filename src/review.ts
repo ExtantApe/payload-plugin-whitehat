@@ -20,17 +20,18 @@ const statusOf = (e: unknown): number => Number((e as { status?: unknown })?.sta
 const REFUSAL_STATUSES = [401, 403, 404]
 const REFUSAL_NAMES = ['Forbidden', 'UnauthorizedError', 'NotFound']
 const TX_CODE_NAMES = ['NoSuchTransaction', 'WriteConflict', 'TransactionTooOld', 'TransactionAborted', 'TransactionCommitted', 'OperationNotSupportedInTransaction', 'TransactionExceededLifetimeLimitSeconds']
-const TX_CODES = [112, 225, 244, 251, 256, 263, 290]
+const TX_CODES = [72, 112, 117, 225, 244, 251, 256, 263, 290]
 const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult']
 
-const causesOf = (e: unknown): unknown[] => {
-  const x = e as { cause?: unknown; errors?: unknown; errorResponse?: unknown } | null
-  const list: unknown[] = []
+/** Appends what an error nests to `list`. A loop, not a spread, so a huge `errors` array cannot overflow the call stack. */
+const addCauses = (e: unknown, list: unknown[]): void => {
+  const x = e as { cause?: unknown; errors?: unknown; errorResponse?: unknown; originalError?: unknown } | null
   if (x?.cause !== undefined && x.cause !== null) list.push(x.cause)
   // A driver error keeps the server's reply here, with its own `codeName`, `code`, `errorLabels` and `errmsg`.
   if (x?.errorResponse !== undefined && x.errorResponse !== null) list.push(x.errorResponse)
-  if (Array.isArray(x?.errors)) list.push(...x.errors)
-  return list
+  // GraphQL wraps the error it caught here.
+  if (x?.originalError !== undefined && x.originalError !== null) list.push(x.originalError)
+  if (Array.isArray(x?.errors)) for (let i = 0; i < x.errors.length; i++) list.push(x.errors[i])
 }
 const labelsOf = (e: unknown): string[] => {
   const l = (e as { errorLabels?: unknown } | null)?.errorLabels
@@ -39,7 +40,7 @@ const labelsOf = (e: unknown): string[] => {
 
 const MAX_DEPTH = 6
 /**
- * Visits an error and everything nested in its `cause`, `errorResponse` and `errors`, breadth first, each object once
+ * Visits an error and everything nested in its `cause`, `errorResponse`, `originalError` and `errors`, breadth first, each object once
  * (a cycle or a node shared by several parents is not walked again), to a bounded depth. Stops at the first node
  * `test` accepts.
  */
@@ -55,7 +56,7 @@ function someNode(error: unknown, test: (node: unknown) => boolean): boolean {
         seen.add(node)
       }
       if (test(node)) return true
-      if (typeof node === 'object') next.push(...causesOf(node))
+      if (typeof node === 'object') addCauses(node, next)
     }
     level = next
   }
@@ -64,15 +65,16 @@ function someNode(error: unknown, test: (node: unknown) => boolean): boolean {
 
 const ownTransactionError = (error: unknown): boolean => {
   if (error === null || typeof error !== 'object') return false
-  const e = error as { codeName?: unknown; code?: unknown; name?: unknown }
+  const e = error as { codeName?: unknown; code?: unknown; name?: unknown; errmsg?: unknown }
   if (TX_CODE_NAMES.includes(String(e.codeName)) || TX_CODE_NAMES.includes(String(e.name))) return true
-  if (typeof e.code === 'number' && TX_CODES.includes(e.code) && (typeof e.codeName === 'string' || /^Mongo/.test(String(e.name)))) return true
+  if (typeof e.code === 'number' && TX_CODES.includes(e.code) && (typeof e.codeName === 'string' || typeof e.errmsg === 'string' || /^Mongo/.test(String(e.name)))) return true
   return labelsOf(error).some((l) => TX_LABELS.includes(l))
 }
 const ownDatabaseError = (error: unknown): boolean => {
   if (error === null || typeof error !== 'object') return false
-  const e = error as { codeName?: unknown; name?: unknown }
-  return ownTransactionError(error) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || labelsOf(error).length > 0
+  const e = error as { codeName?: unknown; name?: unknown; code?: unknown; errmsg?: unknown }
+  // A server reply (`errmsg` with a numeric `code`) is the database talking, even without a `codeName`.
+  return ownTransactionError(error) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || (typeof e.errmsg === 'string' && typeof e.code === 'number') || labelsOf(error).length > 0
 }
 
 /**
@@ -95,10 +97,17 @@ export function isDatabaseError(error: unknown): boolean {
  * a message, so this is the last line of defense. The list is short on purpose: ordinary refusal text such as "Use a
  * replica set" or "You are not allowed to perform this action" must not match.
  */
-const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|\btransactions?\b[^.\n]{0,60}\bhas been aborted|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bsession\b[^.\n]{0,60}\bwas killed|\bwrite conflict\b|Cannot start transaction[^.\n]{0,120}\bnewer transaction\b|\bnewer transaction\b[^.\n]{0,60}\balready started|No transaction started|Transaction[^.\n]{0,40}already in progress|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction/i
+const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|ConflictingOperationInProgress|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bwrite conflict\b|No transaction started|Read preference in a transaction|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction|\btxnNumber\b|\blsid\b|:: caused by ::|\b(?:abortTransaction|commitTransaction|withTransaction|ClientSession)\b|\btimeoutMS\b/i
+/** Pairs of words that together read as a driver fault. Tested apart, with no character window, so a long real message still matches. */
+const DATABASE_MESSAGE_PAIRS: [RegExp, RegExp][] = [
+  [/\btransactions?\b/i, /\b(?:has|have) been (?:aborted|committed)\b|\bwas (?:aborted|committed)\b|\balready (?:aborted|committed)\b|\blifetime\b/i],
+  [/\bsession\b/i, /\bwas killed\b|\b(?:has|have) ended\b|\bended session\b/i],
+  [/\bnewer transaction\b/i, /\balready started\b|\bCannot start transaction\b/i],
+  [/\bTransaction\b/i, /\balready in progress\b/i],
+]
 /** Whether a message reads like the database's own session or transaction failure (see `DATABASE_MESSAGE`). */
 export function isDatabaseErrorMessage(message: string): boolean {
-  return DATABASE_MESSAGE.test(message)
+  return DATABASE_MESSAGE.test(message) || DATABASE_MESSAGE_PAIRS.some(([a, b]) => a.test(message) && b.test(message))
 }
 /** Whether the error's message, or the message of anything nested in `cause`, `errorResponse` or `errors` (bounded depth, each object once), is the database's own. */
 function databaseMessageIn(error: unknown): boolean {
@@ -317,9 +326,16 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 // ---------------------------------------------------------------------------------------------------------
 
 /** Words a plugin uses when it says no on purpose, as opposed to a transaction fault that merely mentions the word. */
-const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't|cannot|can't|unable|not (?:available|enabled|supported|allowed)|disabled|turned off|(?:is|are) off|switched off|without|replica set)\b/i
-/** By default a refusal mentions transactions and says no on purpose. The word alone is not enough: "Transaction failed" is a fault. */
-const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said) && !isValidationError(error)
+const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't|cannot|can't|unable|not (?:available|enabled|supported|allowed)|disabled|off|without|replica set)\b/i
+/**
+ * By default a refusal comes from the plugin saying no: an error with a refusal status (401, 403, 404) or name, or a
+ * Payload `APIError`, that mentions transactions and says no on purpose. A bare message from a plain Error is not
+ * enough, since driver and wrapper faults are plain text too; give `refusal` your own pattern for that.
+ */
+const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
+  const refusalShaped = REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name)) || String((error as { name?: unknown })?.name) === 'APIError'
+  return refusalShaped && /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said) && !isValidationError(error)
+}
 
 /**
  * A plugin that relies on transactions must refuse to run without them. Payload starts without transactions
@@ -333,8 +349,9 @@ const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => /transaction/i.tes
  *   for the writes only. A guard that checks transactions once at start-up passes start-up and is caught here,
  *   as is a guard that reads `req.transactionID` without awaiting it.
  *
- * `refusal` says what a proper refusal looks like; by default an error that mentions transactions and says no on purpose
- * (needs, requires, must, refuses, cannot, without, off, replica set), but isn't one of the database's own. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
+ * `refusal` says what a proper refusal looks like; by default an error with a refusal status (401, 403, 404) or an
+ * APIError that mentions transactions and says no on purpose (needs, requires, must, refuses, cannot, without, off,
+ * replica set), but isn't one of the database's own. A plain Error with only a message is not-checked by default. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
  * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, and by Mongo's
  * own message words (also in a nested `cause` or `errorResponse`) when a wrapper kept only the text, and a database error is never a refusal, whatever `refusal` matches. A validation error is
  * not one by default. Any other error is "not checked".

@@ -1,7 +1,7 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoClient } from 'mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
-import { BasePayload, buildConfig, type Payload } from 'payload'
+import { APIError, BasePayload, buildConfig, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
 import { HOST_ANSWERS, isDatabaseError, isDatabaseErrorMessage, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
@@ -393,7 +393,7 @@ describe('review round 2', () => {
     expect(out.filter((f) => f.status === 'fail').map((f) => f.path)).toEqual(['v · empty-object', 'v · zero', 'v · empty-string', 'v · throw', 'v · where', 'v · one', 'v · yes-string', 'v · empty-array', 'v · false', 'v · function'])
   })
   it('C: the plugin’s own “Use a replica set” advice is a refusal, Mongo’s own message is not', async () => {
-    const run = (said: string) => runTransactionCheck({ start: async () => { throw new Error(said) }, write: async () => undefined })
+    const run = (said: string) => runTransactionCheck({ start: async () => { throw Object.assign(new Error(said), { status: 403 }) }, write: async () => undefined })
     expect((await run('This plugin needs transactions. Use a replica set.'))[0]).toMatchObject({ status: 'pass' })
     expect((await run('Transaction numbers are only allowed on a replica set member or mongos'))[0]).toMatchObject({ status: 'not-checked' })
   })
@@ -718,10 +718,10 @@ describe('review round 6: more driver wording, a stricter default refusal, cycle
     'Cannot call commitTransaction after calling abortTransaction',
     'Cannot call abortTransaction after calling commitTransaction',
   ]
-  const runDefault = (said: string, mode: 'start' | 'write') =>
+  const runDefault = (said: string, mode: 'start' | 'write', make: (m: string) => Error = (m) => new Error(m)) =>
     runTransactionCheck({
-      start: mode === 'start' ? async () => { throw new Error(said) } : async () => ({ payload: await boot('r6-default', false) }),
-      write: async () => { throw new Error(said) },
+      start: mode === 'start' ? async () => { throw make(said) } : async () => ({ payload: await boot('r6-default', false) }),
+      write: async () => { throw make(said) },
     })
 
   it('real driver wording is a database message', () => {
@@ -742,7 +742,7 @@ describe('review round 6: more driver wording, a stricter default refusal, cycle
   })
   it('plugin refusal messages that mention transactions still pass by default', async () => {
     for (const said of ['This plugin needs database transactions, and they are off.', 'Transactions are required. Use a replica set.', 'Unknown status.', 'You can’t accept this offer.']) {
-      const [f] = await runDefault(said, 'start')
+      const [f] = await runDefault(said, 'start', (m) => Object.assign(new Error(m), { status: 403 }))
       // Only messages that mention transactions can be a default refusal here.
       expect(f!.status, said).toBe(/transaction/i.test(said) ? 'pass' : 'not-checked')
     }
@@ -772,6 +772,83 @@ describe('review round 6: more driver wording, a stricter default refusal, cycle
     expect(isRefusal(named)).toBe(false)
     expect(isTransactionError(labelled)).toBe(true)
     expect(isRefusal(labelled)).toBe(false)
+  })
+})
+
+describe('refusal rule: bare messages, structural driver text, originalError, huge errors lists', () => {
+  const tooOld = `Cannot start transaction 4 on session 8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11 because a newer transaction 5 has already started. ` +
+    `{ lsid: { id: UUID("8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11") }, txnNumber: 4, autocommit: false, startTransaction: true, $clusterTime: { clusterTime: Timestamp(1732380000, 1) } } `.repeat(3)
+  const item2 = ['Cannot call abortTransaction twice', 'Read preference in a transaction must be primary, not: secondary', 'Cannot use timeoutMS inside withTransaction: set it on the client or the session']
+  const driverLong = [tooOld, ...item2, 'MongoClientSession: Cannot use a ClientSession that has ended', 'Transaction 9 has been committed already', 'Transaction exceeded the lifetime limit of 60 seconds', 'The session was killed by an admin', 'x :: caused by :: y']
+  const runDefault = (make: () => Error, mode: 'start' | 'write', refusal?: RegExp) =>
+    runTransactionCheck({
+      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r8-default', false) }),
+      write: async () => { throw make() },
+      refusal,
+    })
+
+  it('the real-length TransactionTooOld text and driver wording are database messages', () => {
+    expect(tooOld.length).toBeGreaterThan(400)
+    for (const m of driverLong) expect(isDatabaseErrorMessage(m), m.slice(0, 60)).toBe(true)
+  })
+  it('a driver message is never a refusal by default or under /transaction|session/, even with a 403', async () => {
+    for (const m of driverLong) {
+      for (const make of [() => new Error(m), () => Object.assign(new Error(m), { status: 403 })]) {
+        for (const refusal of [undefined, /transaction|session/i]) {
+          for (const mode of ['start', 'write'] as const) {
+            const [f] = await runDefault(make, mode, refusal)
+            expect(f!.status, `${mode}: ${m.slice(0, 50)}`).toBe('not-checked')
+          }
+        }
+      }
+      expect(isRefusal(Object.assign(new Error(m), { status: 403 })), m.slice(0, 50)).toBe(false)
+    }
+  })
+  it('codes 117 and 72 are database errors, with or without a codeName, so a loose custom pattern cannot pass them', async () => {
+    const shapes = [
+      Object.assign(new Error('Operation not allowed here, session cannot proceed'), { name: 'MongoServerError', code: 117, codeName: 'ConflictingOperationInProgress' }),
+      Object.assign(new Error('Operation not allowed here, session cannot proceed'), { name: 'MongoServerError', code: 72, codeName: 'InvalidOptions' }),
+      Object.assign(new Error('Operation not allowed here, transaction cannot proceed'), { status: 403, errorResponse: { code: 117, errmsg: 'transaction needs another way' } }),
+      Object.assign(new Error('Operation not allowed here, transaction cannot proceed'), { status: 403, errorResponse: { code: 72, errmsg: 'transaction needs another way' } }),
+    ]
+    for (const e of shapes) {
+      expect(isDatabaseError(e)).toBe(true)
+      expect(isRefusal(e)).toBe(false)
+      const [f] = await runDefault(() => e, 'start', /transaction|session/i)
+      expect(f!.status).toBe('not-checked')
+    }
+  })
+  it('a bare message is not a refusal by default; a 403, an APIError or the caller’s own pattern make it one', async () => {
+    const said = 'This plugin has transactions off, so it cannot run.'
+    expect((await runDefault(() => new Error(said), 'start'))[0]!.status).toBe('not-checked')
+    expect((await runDefault(() => Object.assign(new Error(said), { status: 403 }), 'start'))[0]!.status).toBe('pass')
+    expect((await runDefault(() => new APIError(said, 500), 'start'))[0]!.status).toBe('pass')
+    expect((await runDefault(() => new APIError(said, 403), 'write'))[0]!.status).toBe('pass')
+    expect((await runDefault(() => new Error(said), 'start', /transactions off/))[0]!.status).toBe('pass')
+    // A refusal status alone is not enough: the text still has to say no about transactions.
+    expect((await runDefault(() => Object.assign(new Error('Transaction failed'), { status: 403 }), 'start'))[0]!.status).toBe('not-checked')
+  })
+  it('originalError is walked', () => {
+    const wrapped = Object.assign(new Error('Something went wrong'), { originalError: Object.assign(new Error('x'), { codeName: 'WriteConflict' }) })
+    expect(isDatabaseError(wrapped)).toBe(true)
+    expect(isTransactionError(wrapped)).toBe(true)
+    expect(isRefusal(Object.assign(wrapped, { status: 403 }))).toBe(false)
+    const msg = Object.assign(new Error('Unexpected error.'), { status: 403, originalError: new Error(item2[0]) })
+    expect(isRefusal(msg)).toBe(false)
+  })
+  it('an errors array of 250,000 entries does not overflow, and a database entry at the end is found', () => {
+    const errors: unknown[] = []
+    for (let i = 0; i < 250_000; i++) errors.push(new Error(`row ${i} failed`))
+    const plain = Object.assign(new Error('Many failures'), { status: 403, errors })
+    expect(isRefusal(plain)).toBe(true)
+    errors.push(Object.assign(new Error('x'), { codeName: 'WriteConflict' }))
+    expect(isDatabaseError(plain)).toBe(true)
+    expect(isRefusal(plain)).toBe(false)
+  })
+  it('ordinary plugin refusals stay refusals', async () => {
+    for (const said of ['This plugin needs database transactions, and they are off.', 'Transactions are required. Use a replica set.', 'This plugin has transactions off.']) {
+      expect((await runDefault(() => Object.assign(new Error(said), { status: 403 }), 'start'))[0]!.status, said).toBe('pass')
+    }
   })
 })
 
