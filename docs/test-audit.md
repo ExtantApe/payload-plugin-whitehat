@@ -2,6 +2,13 @@
 
 Newest first.
 
+## 2026-11-23 (round 9): walk limits, APIError status, more driver text, hostile properties
+
+Suite: 123 tests before, 128 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).
+
+- **Covered.** A driver error just past the depth limit under a 403 is not-checked (7, 8, 9 and 30 links), a cycle still ends and passes a plain refusal. APIError at 500, 200, 503, 400 and with no status is not-checked; 401, 403, 404, 409 and 429 pass. Eleven driver texts are database messages, also under a broad pattern; "has transactions off" with a 403 still passes. Driver errors hidden in writeErrors, writeConcernError, errInfo, errorResponse, extensions, result and err are found. Throwing getters (message, status, cause, a nested code, a hostile proxy) give not-checked. All five new cases and the two updated ones fail on the old code; in case 3, "Cannot call abortTransaction twice", the read preference text and "Given transaction number" were already caught, the rest fail there.
+- **Skipped.** A node cap: the walk is linear with a visited set, and the existing 250,000 entry test keeps passing.
+
 ## 2026-11-23 (refusal rule): bare messages, structural driver text, nested errors
 
 Suite: 116 tests before, 123 after (`npx vitest run`, run twice; real Payload 3.92 and in-memory MongoDB).

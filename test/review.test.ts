@@ -701,12 +701,13 @@ describe('review round 5: real driver wording, and database messages nested in a
       expect(f!.status).toBe('not-checked')
     }
   })
-  it('a nested ordinary refusal still passes, and a very deep chain does not hang', async () => {
+  it('a nested ordinary refusal still passes, and a very deep chain does not hang or pass', async () => {
     const ok = Object.assign(new Error('Members only'), { status: 403, cause: new Error('Use a replica set') })
     expect(isRefusal(ok)).toBe(true)
     let deep: Error = new Error(real[1])
     for (let i = 0; i < 50; i++) deep = Object.assign(new Error('w'), { status: 403, cause: deep })
-    expect(isRefusal(deep)).toBe(true)
+    // The chain is longer than the walk goes, so what lies past the limit is unknown, and unknown is not a refusal.
+    expect(isRefusal(deep)).toBe(false)
   })
 })
 
@@ -822,7 +823,7 @@ describe('refusal rule: bare messages, structural driver text, originalError, hu
     const said = 'This plugin has transactions off, so it cannot run.'
     expect((await runDefault(() => new Error(said), 'start'))[0]!.status).toBe('not-checked')
     expect((await runDefault(() => Object.assign(new Error(said), { status: 403 }), 'start'))[0]!.status).toBe('pass')
-    expect((await runDefault(() => new APIError(said, 500), 'start'))[0]!.status).toBe('pass')
+    expect((await runDefault(() => new APIError(said, 500), 'start'))[0]!.status).toBe('not-checked')
     expect((await runDefault(() => new APIError(said, 403), 'write'))[0]!.status).toBe('pass')
     expect((await runDefault(() => new Error(said), 'start', /transactions off/))[0]!.status).toBe('pass')
     // A refusal status alone is not enough: the text still has to say no about transactions.
@@ -849,6 +850,108 @@ describe('refusal rule: bare messages, structural driver text, originalError, hu
     for (const said of ['This plugin needs database transactions, and they are off.', 'Transactions are required. Use a replica set.', 'This plugin has transactions off.']) {
       expect((await runDefault(() => Object.assign(new Error(said), { status: 403 }), 'start'))[0]!.status, said).toBe('pass')
     }
+  })
+})
+
+describe('round 9: walk limits, APIError status, driver text, more fields, throwing getters', () => {
+  const chain = (hidden: unknown, links: number): Error => {
+    let e: Error = Object.assign(new Error('inner'), { cause: hidden })
+    for (let i = 1; i < links; i++) e = Object.assign(new Error('w'), { cause: e })
+    return e
+  }
+  const run = (make: () => unknown, mode: 'start' | 'write' = 'start', refusal?: RegExp) =>
+    runTransactionCheck({
+      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r9', false) }),
+      write: async () => { throw make() },
+      refusal,
+    })
+  const refusalText = 'This plugin needs transactions, and they are off.'
+  const driver = () => Object.assign(new Error('x'), { name: 'MongoServerError', codeName: 'WriteConflict' })
+
+  it('1: a driver error just past the walk limit under a 403 is not-checked, and a cycle still ends', async () => {
+    for (const links of [7, 8, 9, 30]) {
+      const e = Object.assign(chain(driver(), links), { status: 403, message: refusalText })
+      expect(isDatabaseError(e), `links ${links}`).toBe(true)
+      expect(isRefusal(e)).toBe(false)
+      expect((await run(() => e))[0]!.status, `links ${links}`).toBe('not-checked')
+      expect((await run(() => e, 'write'))[0]!.status).toBe('not-checked')
+    }
+    // Within the limit it is found as before.
+    expect((await run(() => Object.assign(chain(driver(), 3), { status: 403, message: refusalText })))[0]!.status).toBe('not-checked')
+    // A cycle is a finished walk, so a plain refusal in a cycle still passes.
+    const a = Object.assign(new Error(refusalText), { status: 403 }) as Error & { cause?: unknown }
+    a.cause = Object.assign(new Error('b'), { cause: a })
+    expect((await run(() => a))[0]!.status).toBe('pass')
+  })
+  it('2: an APIError is a refusal only with a 4xx status', async () => {
+    for (const status of [500, undefined, 200, 503]) {
+      const e = new APIError(refusalText, status as number)
+      if (status === undefined) delete (e as { status?: number }).status
+      expect((await run(() => e))[0]!.status, String(status)).toBe('not-checked')
+    }
+    for (const status of [401, 403, 404, 409, 429]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('pass')
+    // 400 is a validation error whatever the class.
+    expect((await run(() => new APIError(refusalText, 400)))[0]!.status).toBe('not-checked')
+  })
+  it('3: more live driver wording is a database message, also under a broad pattern, while plugin refusals still pass', async () => {
+    const texts = [
+      'Cannot call abortTransaction twice',
+      'Read preference in a transaction must be primary, not: secondaryPreferred',
+      'Transaction 12 has been committed.',
+      'Transaction 12 has been aborted.',
+      'Given transaction number 4 does not match any in-progress transactions. The active transaction number is 5',
+      'Cannot continue txnId 7 on this connection',
+      'Operation exceeded time limit',
+      'Session 8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11 was ended',
+      'Session 8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11 has expired',
+      'Cannot use a session that has ended',
+      'Use of expired sessions is not permitted',
+    ]
+    for (const t of texts) {
+      expect(isDatabaseErrorMessage(t), t).toBe(true)
+      for (const refusal of [undefined, /transaction|session|time limit|txn/i]) expect((await run(() => Object.assign(new Error(t), { status: 403 }), 'start', refusal))[0]!.status, t).toBe('not-checked')
+    }
+    expect(isDatabaseErrorMessage('Your session has expired. Sign in again.')).toBe(false)
+    for (const ok of ['This plugin has transactions off.', 'Transactions are required. Use a replica set.']) {
+      expect((await run(() => Object.assign(new Error(ok), { status: 403 })))[0]!.status, ok).toBe('pass')
+    }
+  })
+  it('4: a driver error hidden in writeErrors, writeConcernError, errInfo, errorResponse, extensions or result is found', async () => {
+    const hiddenIn = (key: string, value: unknown) => Object.assign(new Error(refusalText), { status: 403, [key]: value })
+    const cases: Record<string, unknown> = {
+      writeErrors: [{ code: 112, errmsg: 'plain text' }],
+      writeConcernError: driver(),
+      errInfo: { codeName: 'WriteConflict' },
+      errorResponse: { code: 251, errmsg: 'x' },
+      extensions: { originalError: driver() },
+      result: { errors: [driver()] },
+      err: { code: 112, errmsg: 'plain text' },
+    }
+    for (const [key, value] of Object.entries(cases)) {
+      const e = hiddenIn(key, value)
+      expect(isDatabaseError(e), key).toBe(true)
+      expect(isRefusal(e), key).toBe(false)
+      expect((await run(() => e))[0]!.status, key).toBe('not-checked')
+    }
+    const text = hiddenIn('writeErrors', [{ errmsg: 'Cannot call abortTransaction twice' }])
+    expect(isRefusal(text)).toBe(false)
+  })
+  it('5: a throwing property makes the result not-checked, never a crash or a pass', async () => {
+    const boom = () => { throw new Error('getter exploded') }
+    const msg = Object.defineProperty(new Error('x'), 'message', { get: boom })
+    Object.assign(msg, { status: 403 })
+    const status = Object.defineProperty(new Error(refusalText), 'status', { get: boom })
+    const cause = Object.defineProperty(Object.assign(new Error(refusalText), { status: 403 }), 'cause', { get: boom })
+    const nested = Object.assign(new Error(refusalText), { status: 403, cause: Object.defineProperty(new Error('y'), 'code', { get: boom }) })
+    const proxy = new Proxy({}, { get: boom, has: boom, ownKeys: boom })
+    for (const e of [msg, status, cause, nested, proxy]) {
+      expect(isRefusal(e)).toBe(false)
+      expect(isDatabaseError(e)).toBe(true)
+      for (const mode of ['start', 'write'] as const) expect((await run(() => e, mode, /./))[0]!.status).toBe('not-checked')
+      expect((await run(() => e))[0]!.status).toBe('not-checked')
+    }
+    const [r] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'g', title: 'g', run: async () => { throw msg } }] })
+    expect(r!.status).toBe('not-checked')
   })
 })
 

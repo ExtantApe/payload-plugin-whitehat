@@ -23,73 +23,123 @@ const TX_CODE_NAMES = ['NoSuchTransaction', 'WriteConflict', 'TransactionTooOld'
 const TX_CODES = [72, 112, 117, 225, 244, 251, 256, 263, 290]
 const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult']
 
-/** Appends what an error nests to `list`. A loop, not a spread, so a huge `errors` array cannot overflow the call stack. */
-const addCauses = (e: unknown, list: unknown[]): void => {
-  const x = e as { cause?: unknown; errors?: unknown; errorResponse?: unknown; originalError?: unknown } | null
-  if (x?.cause !== undefined && x.cause !== null) list.push(x.cause)
-  // A driver error keeps the server's reply here, with its own `codeName`, `code`, `errorLabels` and `errmsg`.
-  if (x?.errorResponse !== undefined && x.errorResponse !== null) list.push(x.errorResponse)
-  // GraphQL wraps the error it caught here.
-  if (x?.originalError !== undefined && x.originalError !== null) list.push(x.originalError)
-  if (Array.isArray(x?.errors)) for (let i = 0; i < x.errors.length; i++) list.push(x.errors[i])
-}
-const labelsOf = (e: unknown): string[] => {
-  const l = (e as { errorLabels?: unknown } | null)?.errorLabels
-  return Array.isArray(l) ? l.map(String) : l instanceof Set ? [...l].map(String) : []
+/** Where an error can nest another one: GraphQL, the driver's server reply and bulk write errors, among others. */
+const NESTED_KEYS = ['cause', 'originalError', 'errorResponse', 'errors', 'writeErrors', 'writeConcernError', 'errInfo', 'extensions', 'result', 'err'] as const
+
+/** What the walk reads from one error, taken once and safely: a property that throws marks the snapshot unreadable. */
+type Snap = { name: unknown; code: unknown; codeName: unknown; errmsg: unknown; labels: string[]; status: number; text: string; children: unknown[]; unreadable: boolean }
+
+/** Reads each property inside try/catch (a getter can throw), so a hostile error cannot crash a check. A throw means "unreadable". */
+function snapshot(node: unknown): Snap {
+  const snap: Snap = { name: undefined, code: undefined, codeName: undefined, errmsg: undefined, labels: [], status: NaN, text: '', children: [], unreadable: false }
+  if (typeof node === 'string') {
+    snap.text = node
+    return snap
+  }
+  const o = node as Record<string, unknown>
+  const get = (k: string): unknown => {
+    try {
+      return o[k]
+    } catch {
+      snap.unreadable = true
+      return undefined
+    }
+  }
+  snap.name = get('name')
+  snap.code = get('code')
+  snap.codeName = get('codeName')
+  snap.errmsg = get('errmsg')
+  const status = get('status') ?? get('statusCode')
+  snap.status = Number(status ?? NaN)
+  try {
+    const l = get('errorLabels')
+    snap.labels = Array.isArray(l) ? l.map(String) : l instanceof Set ? [...l].map(String) : []
+    const message = get('message')
+    snap.text = String(message ?? node)
+    const d = get('data')
+    if (d !== undefined && d !== null) {
+      try {
+        snap.text += JSON.stringify(d) ?? ''
+      } catch {
+        // an unserializable data object adds nothing to the text
+      }
+    }
+  } catch {
+    snap.unreadable = true
+  }
+  for (const k of NESTED_KEYS) {
+    const v = get(k)
+    if (v === undefined || v === null) continue
+    try {
+      if (Array.isArray(v)) for (let i = 0; i < v.length; i++) snap.children.push(v[i])
+      else snap.children.push(v)
+    } catch {
+      snap.unreadable = true
+    }
+  }
+  return snap
 }
 
 const MAX_DEPTH = 6
+const walkable = (n: unknown): n is object | string => n !== null && n !== undefined && (typeof n === 'object' || typeof n === 'string')
 /**
- * Visits an error and everything nested in its `cause`, `errorResponse`, `originalError` and `errors`, breadth first, each object once
- * (a cycle or a node shared by several parents is not walked again), to a bounded depth. Stops at the first node
- * `test` accepts.
+ * Visits an error and everything nested in it (see `NESTED_KEYS`), breadth first, each object once (a cycle or a node
+ * shared by several parents is not walked again), to MAX_DEPTH levels. Stops at the first node `test` accepts.
+ * `incomplete` is true when the walk could not finish: the depth limit was reached with nodes still unvisited, or a
+ * property on some node threw. Callers that guard against a database error must then treat the answer as unknown.
  */
-function someNode(error: unknown, test: (node: unknown) => boolean): boolean {
+function walk(error: unknown, test: (snap: Snap) => boolean): { hit: boolean; incomplete: boolean } {
   const seen = new WeakSet<object>()
   let level: unknown[] = [error]
+  let incomplete = false
   for (let depth = 0; depth <= MAX_DEPTH && level.length > 0; depth++) {
     const next: unknown[] = []
     for (const node of level) {
-      if (node === null || node === undefined || (typeof node !== 'object' && typeof node !== 'string')) continue
+      if (!walkable(node)) continue
       if (typeof node === 'object') {
         if (seen.has(node)) continue
         seen.add(node)
       }
-      if (test(node)) return true
-      if (typeof node === 'object') addCauses(node, next)
+      const snap = snapshot(node)
+      if (snap.unreadable) incomplete = true
+      if (test(snap)) return { hit: true, incomplete }
+      for (const c of snap.children) next.push(c)
     }
     level = next
   }
-  return false
+  // Anything left over was never looked at, unless it is a node already seen (a cycle).
+  if (level.some((n) => walkable(n) && !(typeof n === 'object' && seen.has(n)))) incomplete = true
+  return { hit: false, incomplete }
 }
 
-const ownTransactionError = (error: unknown): boolean => {
-  if (error === null || typeof error !== 'object') return false
-  const e = error as { codeName?: unknown; code?: unknown; name?: unknown; errmsg?: unknown }
+const ownTransactionError = (e: Snap): boolean => {
   if (TX_CODE_NAMES.includes(String(e.codeName)) || TX_CODE_NAMES.includes(String(e.name))) return true
   if (typeof e.code === 'number' && TX_CODES.includes(e.code) && (typeof e.codeName === 'string' || typeof e.errmsg === 'string' || /^Mongo/.test(String(e.name)))) return true
-  return labelsOf(error).some((l) => TX_LABELS.includes(l))
+  return e.labels.some((l) => TX_LABELS.includes(l))
 }
-const ownDatabaseError = (error: unknown): boolean => {
-  if (error === null || typeof error !== 'object') return false
-  const e = error as { codeName?: unknown; name?: unknown; code?: unknown; errmsg?: unknown }
+const ownDatabaseError = (e: Snap): boolean =>
   // A server reply (`errmsg` with a numeric `code`) is the database talking, even without a `codeName`.
-  return ownTransactionError(error) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || (typeof e.errmsg === 'string' && typeof e.code === 'number') || labelsOf(error).length > 0
-}
+  ownTransactionError(e) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || (typeof e.errmsg === 'string' && typeof e.code === 'number') || e.labels.length > 0
 
 /**
  * Whether an error is the database's own transaction trouble: a driver error with a transaction `codeName`
  * (NoSuchTransaction, WriteConflict ...), code, or `errorLabels` entry (TransientTransactionError), on the error,
- * on its `errorResponse`, or on anything in its `cause` chain or `errors` list. Real driver errors carry the name
- * only in those fields; their message is plain text.
+ * on its `errorResponse`, or on anything nested in it (`cause`, `originalError`, `errors`, `writeErrors`,
+ * `writeConcernError`, `errInfo`, `extensions`, `result`). Real driver errors carry the name only in those fields;
+ * their message is plain text. Exact: a walk that could not finish says false here, though `isDatabaseError` says true.
  */
 export function isTransactionError(error: unknown): boolean {
-  return someNode(error, ownTransactionError)
+  return walk(error, ownTransactionError).hit
 }
 
-/** Whether an error comes from the database driver (Mongo's own errors, transaction or not): never the plugin saying no. */
+/**
+ * Whether an error comes from the database driver (Mongo's own errors, transaction or not): never the plugin saying
+ * no. When the walk cannot finish (the chain is deeper than MAX_DEPTH levels, or a property throws) a driver error
+ * may be hiding past the limit, so the answer is true: unknown is never a refusal.
+ */
 export function isDatabaseError(error: unknown): boolean {
-  return someNode(error, ownDatabaseError)
+  const r = walk(error, ownDatabaseError)
+  return r.hit || r.incomplete
 }
 
 /**
@@ -97,11 +147,12 @@ export function isDatabaseError(error: unknown): boolean {
  * a message, so this is the last line of defense. The list is short on purpose: ordinary refusal text such as "Use a
  * replica set" or "You are not allowed to perform this action" must not match.
  */
-const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|ConflictingOperationInProgress|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bwrite conflict\b|No transaction started|Read preference in a transaction|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction|\btxnNumber\b|\blsid\b|:: caused by ::|\b(?:abortTransaction|commitTransaction|withTransaction|ClientSession)\b|\btimeoutMS\b/i
+const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|ConflictingOperationInProgress|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bwrite conflict\b|No transaction started|Read preference in a transaction|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction|\btxnNumber\b|\blsid\b|:: caused by ::|\b(?:abortTransaction|commitTransaction|withTransaction|ClientSession)\b|\btimeoutMS\b|\btxn(?:Id|Nums?)\b|operation exceeded time limit|\blogical session\b/i
 /** Pairs of words that together read as a driver fault. Tested apart, with no character window, so a long real message still matches. */
 const DATABASE_MESSAGE_PAIRS: [RegExp, RegExp][] = [
   [/\btransactions?\b/i, /\b(?:has|have) been (?:aborted|committed)\b|\bwas (?:aborted|committed)\b|\balready (?:aborted|committed)\b|\blifetime\b/i],
-  [/\bsession\b/i, /\bwas killed\b|\b(?:has|have) ended\b|\bended session\b/i],
+  [/\bsession\b/i, /\bwas (?:killed|ended)\b|\b(?:has|have) ended\b|\bended session\b/i],
+  [/\bsession\s+(?:id\s+)?[0-9a-f-]{8,}/i, /\bexpired\b|\bended\b/i],
   [/\bnewer transaction\b/i, /\balready started\b|\bCannot start transaction\b/i],
   [/\bTransaction\b/i, /\balready in progress\b/i],
 ]
@@ -109,13 +160,10 @@ const DATABASE_MESSAGE_PAIRS: [RegExp, RegExp][] = [
 export function isDatabaseErrorMessage(message: string): boolean {
   return DATABASE_MESSAGE.test(message) || DATABASE_MESSAGE_PAIRS.some(([a, b]) => a.test(message) && b.test(message))
 }
-/** Whether the error's message, or the message of anything nested in `cause`, `errorResponse` or `errors` (bounded depth, each object once), is the database's own. */
+/** Whether the error's message, or the message of anything nested in it (bounded depth, each object once), is the database's own. An unfinished walk says true. */
 function databaseMessageIn(error: unknown): boolean {
-  return someNode(error, (node) => {
-    if (typeof node === 'string') return isDatabaseErrorMessage(node)
-    const e = node as { errmsg?: unknown }
-    return isDatabaseErrorMessage(messageOf(node)) || (typeof e.errmsg === 'string' && isDatabaseErrorMessage(e.errmsg))
-  })
+  const r = walk(error, (n) => isDatabaseErrorMessage(n.text) || (typeof n.errmsg === 'string' && isDatabaseErrorMessage(n.errmsg)))
+  return r.hit || r.incomplete
 }
 
 /**
@@ -125,13 +173,23 @@ function databaseMessageIn(error: unknown): boolean {
  */
 function guardRefusal(custom: ((error: unknown) => boolean) | undefined): (error: unknown) => boolean {
   if (!custom) return isRefusal
-  return (error) => !isDatabaseError(error) && !databaseMessageIn(error) && custom(error)
+  return (error) => {
+    try {
+      return !isDatabaseError(error) && !databaseMessageIn(error) && custom(error)
+    } catch {
+      return false
+    }
+  }
 }
 
 /** A validation error: status 400 or 422, or the name ValidationError. A typo in a probe's data looks like this, so it says nothing about access. */
 export function isValidationError(error: unknown): boolean {
-  const e = error as { name?: unknown } | null
-  return [400, 422].includes(statusOf(error)) || String(e?.name) === 'ValidationError'
+  try {
+    const e = error as { name?: unknown } | null
+    return [400, 422].includes(statusOf(error)) || String(e?.name) === 'ValidationError'
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -141,20 +199,22 @@ export function isValidationError(error: unknown): boolean {
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
-  if (isDatabaseError(error) || databaseMessageIn(error) || isValidationError(error)) return false
-  return REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))
+  try {
+    if (isDatabaseError(error) || databaseMessageIn(error) || isValidationError(error)) return false
+    return REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))
+  } catch {
+    return false
+  }
 }
 const clip = (s: string, n = 100) => (s.length > n ? `${s.slice(0, n)}…` : s)
+/** The message and `data` of an error as text. Never throws: an error whose properties throw reads as "(unreadable error)". */
 const messageOf = (e: unknown): string => {
-  const base = String((e as { message?: unknown })?.message ?? e)
-  let data = ''
   try {
-    const d = (e as { data?: unknown })?.data
-    data = d === undefined || d === null ? '' : JSON.stringify(d)
+    const snap = snapshot(e ?? String(e))
+    return snap.unreadable && snap.text === '' ? '(unreadable error)' : snap.text
   } catch {
-    data = ''
+    return '(unreadable error)'
   }
-  return `${base}${data}`
 }
 const note = (check: string, title: string, role: string, how: string, path?: string, severity: Severity = 'high'): Finding => ({ check, title, severity, status: 'not-checked', role, path, how })
 
@@ -329,11 +389,14 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't|cannot|can't|unable|not (?:available|enabled|supported|allowed)|disabled|off|without|replica set)\b/i
 /**
  * By default a refusal comes from the plugin saying no: an error with a refusal status (401, 403, 404) or name, or a
- * Payload `APIError`, that mentions transactions and says no on purpose. A bare message from a plain Error is not
+ * Payload `APIError` with a 4xx status (a 400 or 422 is a validation error and never counts), that mentions transactions and says no on purpose. A bare message from a plain Error is not
  * enough, since driver and wrapper faults are plain text too; give `refusal` your own pattern for that.
  */
 const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
-  const refusalShaped = REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name)) || String((error as { name?: unknown })?.name) === 'APIError'
+  const status = statusOf(error)
+  // A Payload APIError says no only with a 4xx status. Its default status is 500 and a bare one has none: neither is a refusal.
+  const apiRefusal = String((error as { name?: unknown })?.name) === 'APIError' && status >= 400 && status < 500
+  const refusalShaped = REFUSAL_STATUSES.includes(status) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name)) || apiRefusal
   return refusalShaped && /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said) && !isValidationError(error)
 }
 
@@ -350,7 +413,7 @@ const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
  *   as is a guard that reads `req.transactionID` without awaiting it.
  *
  * `refusal` says what a proper refusal looks like; by default an error with a refusal status (401, 403, 404) or an
- * APIError that mentions transactions and says no on purpose (needs, requires, must, refuses, cannot, without, off,
+ * APIError with a 4xx status (not 400 or 422, which are validation) that mentions transactions and says no on purpose (needs, requires, must, refuses, cannot, without, off,
  * replica set), but isn't one of the database's own. A plain Error with only a message is not-checked by default. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
  * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, and by Mongo's
  * own message words (also in a nested `cause` or `errorResponse`) when a wrapper kept only the text, and a database error is never a refusal, whatever `refusal` matches. A validation error is
@@ -368,7 +431,14 @@ export async function runTransactionCheck(input: {
   const mode = input.mode ?? 'off-at-start'
   const check = 'transactions-required'
   const title = mode === 'off-at-start' ? 'A plugin that needs transactions refuses to run without them' : 'A plugin that needs transactions refuses a write when beginTransaction answers null'
-  const refuses = (said: string, error: unknown) => !isDatabaseError(error) && !isDatabaseErrorMessage(said) && !databaseMessageIn(error) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
+  const refuses = (said: string, error: unknown): boolean => {
+    try {
+      return refusesUnsafe(said, error)
+    } catch {
+      return false // a property or a caller's pattern threw: nothing was learned
+    }
+  }
+  const refusesUnsafe = (said: string, error: unknown) => !isDatabaseError(error) && !isDatabaseErrorMessage(said) && !databaseMessageIn(error) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
   const role = 'server'
   let started: Awaited<ReturnType<typeof input.start>> | undefined
   let restore: (() => void) | undefined
