@@ -1,3 +1,5 @@
+import { types as utilTypes } from 'node:util'
+
 import type { Payload } from 'payload'
 
 import type { Finding, Severity, Viewer } from './index.js'
@@ -14,11 +16,13 @@ import type { Finding, Severity, Viewer } from './index.js'
  * that works leaves the change behind. Run them on a throwaway database, and give the checks a `seed` or clean up.
  */
 
+/** A status counts only when it is a real integer number: '403', 403n, [403] and an object with valueOf are not one. */
+const intStatus = (v: unknown): number => (typeof v === 'number' && Number.isInteger(v) ? v : NaN)
 /** The HTTP status of an error, or NaN. Never throws: a getter that throws reads as NaN. */
 const statusOf = (e: unknown): number => {
   try {
     const o = e as { status?: unknown; statusCode?: unknown } | null | undefined
-    return Number(o?.status ?? o?.statusCode ?? NaN)
+    return intStatus(o?.status ?? o?.statusCode)
   } catch {
     return NaN
   }
@@ -35,7 +39,7 @@ const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult'
 const NESTED_KEYS = ['cause', 'originalError', 'errorResponse', 'errors', 'writeErrors', 'writeConcernError', 'errInfo', 'extensions', 'result', 'err', 'reason', 'response', 'exception', 'details'] as const
 
 /** What the walk reads from one error, taken once and safely: a property that throws marks the snapshot unreadable. */
-type Snap = { name: unknown; code: unknown; codeName: unknown; errmsg: unknown; labels: string[]; status: number; text: string; own: string | null; children: unknown[]; unreadable: boolean }
+type Snap = { name: unknown; code: unknown; codeName: unknown; errmsg: unknown; labels: string[]; status: number; text: string; own: string | null; children: unknown[]; unreadable: boolean; opaque: boolean }
 
 const MAX_CONTAINER = 10_000
 const isPlainObject = (v: object): boolean => {
@@ -44,55 +48,103 @@ const isPlainObject = (v: object): boolean => {
 }
 /**
  * Pushes what a container holds: an array or nested array, a Map's values, a Set's members, an array-like object
- * (`{ length: 2, 0: e, 1: e }`) or a keyed object (`{ first: e }`). Returns false if it could not read all of it.
+ * (`{ length: 2, 0: e, 1: e }`) or a keyed object (`{ first: e }`). Each container is opened once (a self-referential
+ * array ends at once) and at most MAX_CONTAINER entries are read in all. Returns false if it could not read all of it.
  */
-function spread(v: unknown, out: unknown[], depth = 0): boolean {
-  if (v === undefined || v === null) return true
-  if (typeof v !== 'object') {
-    out.push(v)
-    return true
-  }
-  if (depth > 4) {
-    out.push(v)
-    return true
-  }
+function spread(v: unknown, out: unknown[]): boolean {
+  const seen = new Set<object>()
+  let budget = MAX_CONTAINER
   let ok = true
-  const add = (x: unknown) => {
-    if (x !== null && typeof x === 'object' && (Array.isArray(x) || x instanceof Map || x instanceof Set)) ok = spread(x, out, depth + 1) && ok
-    else out.push(x)
-  }
-  if (Array.isArray(v)) {
-    for (let i = 0; i < v.length; i++) add(v[i])
-    return ok
-  }
-  if (v instanceof Map) {
-    for (const [k, x] of v) {
-      add(x)
-      if (k !== null && typeof k === 'object') add(k)
+  const visit = (c: unknown, depth: number): void => {
+    if (c === undefined || c === null) return
+    if (typeof c !== 'object') {
+      out.push(c)
+      return
     }
-    return ok
-  }
-  if (v instanceof Set) {
-    for (const x of v) add(x)
-    return ok
-  }
-  out.push(v)
-  if (isPlainObject(v)) {
-    const len = (v as { length?: unknown }).length
-    if (typeof len === 'number' && Number.isInteger(len) && len >= 0) {
-      if (len > MAX_CONTAINER) return false
-      for (let i = 0; i < len; i++) add((v as Record<number, unknown>)[i])
+    if (depth > 4) {
+      out.push(c)
+      return
     }
-    const keys = Object.keys(v)
-    if (keys.length > MAX_CONTAINER) return false
-    for (const k of keys) add((v as Record<string, unknown>)[k])
+    if (seen.has(c)) return
+    seen.add(c)
+    const add = (x: unknown) => {
+      if (--budget < 0) {
+        ok = false
+        return
+      }
+      if (x !== null && typeof x === 'object' && (Array.isArray(x) || x instanceof Map || x instanceof Set)) visit(x, depth + 1)
+      else out.push(x)
+    }
+    if (Array.isArray(c)) {
+      if (c.length > budget) {
+        ok = false
+        return
+      }
+      for (let i = 0; i < c.length && ok; i++) add(c[i])
+      return
+    }
+    if (c instanceof Map) {
+      for (const [k, x] of c) {
+        if (!ok) return
+        add(x)
+        if (k !== null && typeof k === 'object') add(k)
+      }
+      return
+    }
+    if (c instanceof Set) {
+      for (const x of c) {
+        if (!ok) return
+        add(x)
+      }
+      return
+    }
+    out.push(c)
+    if (isPlainObject(c)) {
+      const len = (c as { length?: unknown }).length
+      if (typeof len === 'number' && Number.isInteger(len) && len >= 0) {
+        if (len > budget) {
+          ok = false
+          return
+        }
+        for (let i = 0; i < len && ok; i++) add((c as Record<number, unknown>)[i])
+      }
+      const keys = Object.keys(c)
+      if (keys.length > budget) {
+        ok = false
+        return
+      }
+      for (const k of keys) {
+        if (!ok) return
+        add((c as Record<string, unknown>)[k])
+      }
+    }
   }
+  visit(v, 0)
   return ok
+}
+
+/**
+ * Whether a node cannot be opened fully by reading its named properties: a Proxy, a class instance that is not an
+ * Error (or an Error from another realm), a Symbol key, or a hidden (non-enumerable) key other than the Error basics.
+ */
+function isOpaque(node: object): boolean {
+  try {
+    if (utilTypes.isProxy(node)) return true
+    if (!isPlainObject(node) && !(node instanceof Error)) return true
+    for (const k of Reflect.ownKeys(node)) {
+      if (typeof k === 'symbol') return true
+      const d = Object.getOwnPropertyDescriptor(node, k)
+      if (d && d.enumerable === false && !['stack', 'message', 'cause'].includes(k)) return true
+    }
+    return false
+  } catch {
+    return true
+  }
 }
 
 /** Reads each property inside try/catch (a getter can throw), so a hostile error cannot crash a check. A throw means "unreadable". */
 function snapshot(node: unknown): Snap {
-  const snap: Snap = { name: undefined, code: undefined, codeName: undefined, errmsg: undefined, labels: [], status: NaN, text: '', own: null, children: [], unreadable: false }
+  const snap: Snap = { name: undefined, code: undefined, codeName: undefined, errmsg: undefined, labels: [], status: NaN, text: '', own: null, children: [], unreadable: false, opaque: false }
   if (typeof node === 'string') {
     snap.text = node
     snap.own = node
@@ -106,6 +158,7 @@ function snapshot(node: unknown): Snap {
     }
     return snap
   }
+  snap.opaque = isOpaque(node as object)
   const o = node as Record<string, unknown>
   const get = (k: string): unknown => {
     try {
@@ -120,7 +173,7 @@ function snapshot(node: unknown): Snap {
   snap.codeName = get('codeName')
   snap.errmsg = get('errmsg')
   const status = get('status') ?? get('statusCode')
-  snap.status = Number(status ?? NaN)
+  snap.status = intStatus(status)
   try {
     const l = get('errorLabels')
     snap.labels = Array.isArray(l) ? l.map(String) : l instanceof Set ? [...l].map(String) : []
@@ -218,7 +271,7 @@ export function isDatabaseError(error: unknown): boolean {
  * a message, so this is the last line of defense. The list is short on purpose: ordinary refusal text such as "Use a
  * replica set" or "You are not allowed to perform this action" must not match.
  */
-const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|ConflictingOperationInProgress|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bwrite conflict\b|No transaction started|Read preference in a transaction|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction|\btxnNumber\b|\blsid\b|:: caused by ::|\b(?:abortTransaction|commitTransaction|withTransaction|ClientSession)\b|\btimeoutMS\b|\btxn(?:Id|Nums?)\b|operation exceeded time limit|\blogical session\b/i
+const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|ConflictingOperationInProgress|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bwrite conflict\b|No transaction started|Read preference in a transaction|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction|\btxnNumber\b|\blsid\b|:: caused by ::|\b(?:abortTransaction|commitTransaction|withTransaction|ClientSession)\b|\btimeoutMS\b|\btxn(?:Id|Nums?)\b|operation exceeded time limit|\blogical session\b|\bE11000\b|duplicate key|\bserver session\b|\bconnection\b[^.]{0,80}\b(?:closed|reset|refused|pool)\b|\bconnection pool\b|\bsocket\b|\bECONN\w+|\bnot primary\b|server selection|Topology was destroyed|\bMongo(?:Network|Server|Server[A-Z]\w*)Error\b|\bcursor id\b|Executor error|\bwriteConcern\b|\bsystem collection\b|\bmulti-statement\b|\bwithin a (?:multi-\w+ )?transaction\b|\b(?:not allowed|cannot be (?:run|used)|is not supported) (?:in|within|inside) (?:a |an )?(?:multi-\w+ )?transactions?\b/i
 /** Pairs of words that together read as a driver fault. Tested apart, with no character window, so a long real message still matches. */
 const DATABASE_MESSAGE_PAIRS: [RegExp, RegExp][] = [
   [/\btransactions?\b/i, /\b(?:has|have) been (?:aborted|committed)\b|\bwas (?:aborted|committed)\b|\balready (?:aborted|committed)\b|\blifetime\b/i],
@@ -264,15 +317,28 @@ export function isValidationError(error: unknown): boolean {
 }
 
 /**
+ * True when everything nested inside an error can be read and says no. Each nested node must be openable (no Proxy,
+ * Symbol or hidden keys, class instance or cross-realm object) and carry a string message that `says` accepts. A
+ * nested error with no string message (an object, an empty one, only a `code`, text only in `stack`), a container
+ * that cannot be opened, or an unfinished walk means the wrapper may be hiding a fault: false, so not a refusal.
+ */
+function nestedAllRefuse(error: unknown, says: (message: string) => boolean): boolean {
+  const r = walk(error, (n, depth) => depth > 0 && (n.opaque || n.own === null || n.own === '' || !says(n.own)))
+  return !r.hit && !r.incomplete
+}
+/**
  * Whether an error is a proper refusal: HTTP 401, 403 or 404, or Payload's Forbidden, UnauthorizedError and
  * NotFound. Not a refusal: a validation error (400, 422, ValidationError), a database or transaction error
  * (checked on the error and its `cause`, by name, `codeName` and `errorLabels`), a plain Error, a 5xx.
+ * Anything nested inside it (`cause`, `errors` ...) must be readable and say no too: a 403 that wraps E11000, a closed
+ * connection or a failed session is a database error, and one that wraps something unreadable is unknown.
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
   try {
     if (isDatabaseError(error) || databaseMessageIn(error) || isValidationError(error)) return false
-    return REFUSAL_STATUSES.includes(statusOf(error)) || REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))
+    if (!REFUSAL_STATUSES.includes(statusOf(error)) && !REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))) return false
+    return nestedAllRefuse(error, (m) => !isDatabaseErrorMessage(m))
   } catch {
     return false
   }
@@ -474,28 +540,42 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 
 /** Words a plugin uses when it says no on purpose, as opposed to a transaction fault that merely mentions the word. */
 const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't|cannot|can't|unable|not (?:available|enabled|supported|allowed)|disabled|off|without|replica set)\b/i
-const refusalText = (said: string): boolean => /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said)
+/** Plain advice a guard may add after saying no: it names the fix. */
+const REFUSAL_ADVICE = /\b(?:replica set|transactionOptions|enable|configure|turn (?:it |them )?on|restart|database adapter|start-?up)\b/i
+/**
+ * Every sentence of a message must read as a refusal: it says no about transactions (a cue word) or gives advice. A
+ * wrapper that appends driver text after a refusal sentence ("needs a transaction: E11000 ...") fails on that text.
+ */
+const everySentenceRefuses = (message: string): boolean => {
+  const parts = message.split(/[.!?;:\n]+|\s[-\u2013\u2014]\s/).map((p) => p.trim()).filter(Boolean)
+  return parts.length > 0 && parts.every((p) => !isDatabaseErrorMessage(p) && ((/transaction/i.test(p) && REFUSAL_CUE.test(p)) || REFUSAL_ADVICE.test(p)))
+}
+const refusalText = (said: string): boolean => /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said) && everySentenceRefuses(said)
 /**
  * Under a refusal wrapper, every message nested inside it must itself read as a refusal. A driver text is too varied
  * to list, so anything nested that is not refusal-shaped means the wrapper may be hiding a fault: not a refusal.
  * An unfinished walk is unknown, so also not a refusal.
  */
-const nestedMessagesRefuse = (error: unknown): boolean => {
-  const r = walk(error, (n, depth) => depth > 0 && n.own !== null && n.own !== '' && !refusalText(n.own))
-  return !r.hit && !r.incomplete
-}
+const nestedMessagesRefuse = (error: unknown): boolean => nestedAllRefuse(error, refusalText)
 /**
  * By default a refusal comes from the plugin saying no: an error with a refusal status (401, 403, 404) or name, or a
- * Payload `APIError` with a 4xx status (a 400 or 422 is a validation error and never counts), that mentions transactions and says no on purpose. A bare message from a plain Error is not
+ * Payload `APIError` with a status of 401, 403 or 404 (any other status, 400 and 422 included, never counts), that mentions transactions and says no on purpose. A bare message from a plain Error is not
  * enough, since driver and wrapper faults are plain text too; give `refusal` your own pattern for that.
  */
 const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
   const status = statusOf(error)
-  // A Payload APIError says no only with a 4xx status. Its default status is 500 and a bare one has none: neither is a refusal.
+  // A Payload APIError says no only with a 401, 403 or 404 status. Its default status is 500 and a bare one has none: neither is a refusal.
   // Only a whole 401, 403 or 404 counts (not 408, 409, 429, 499 or 403.5), whatever the class.
   const name = String((error as { name?: unknown })?.name)
   const refusalShaped = REFUSAL_STATUSES.includes(status) || REFUSAL_NAMES.includes(name)
-  return refusalShaped && refusalText(said) && !isValidationError(error) && nestedMessagesRefuse(error)
+  // The whole own message must read as a refusal, not just a part of it (the text with `data` appended is checked for driver words too).
+  let own: string | null = null
+  try {
+    own = snapshot(error).own
+  } catch {
+    own = null
+  }
+  return refusalShaped && refusalText(said) && own !== null && refusalText(own) && !isValidationError(error) && nestedMessagesRefuse(error)
 }
 
 /**
@@ -511,7 +591,7 @@ const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
  *   as is a guard that reads `req.transactionID` without awaiting it.
  *
  * `refusal` says what a proper refusal looks like; by default an error with a refusal status (401, 403, 404) or an
- * APIError with a 4xx status (not 400 or 422, which are validation) that mentions transactions and says no on purpose (needs, requires, must, refuses, cannot, without, off,
+ * APIError with a status of 401, 403 or 404 (no other status counts) that mentions transactions and says no on purpose (needs, requires, must, refuses, cannot, without, off,
  * replica set), but isn't one of the database's own. A plain Error with only a message is not-checked by default. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
  * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, and by Mongo's
  * own message words (also in a nested `cause` or `errorResponse`) when a wrapper kept only the text, and a database error is never a refusal, whatever `refusal` matches. A validation error is

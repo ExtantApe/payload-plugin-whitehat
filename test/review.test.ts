@@ -841,7 +841,8 @@ describe('refusal rule: bare messages, structural driver text, originalError, hu
     const errors: unknown[] = []
     for (let i = 0; i < 250_000; i++) errors.push(new Error(`row ${i} failed`))
     const plain = Object.assign(new Error('Many failures'), { status: 403, errors })
-    expect(isRefusal(plain)).toBe(true)
+    // Past the size cap the list cannot all be read, and nothing in it says no: unknown is never a refusal.
+    expect(isRefusal(plain)).toBe(false)
     errors.push(Object.assign(new Error('x'), { codeName: 'WriteConflict' }))
     expect(isDatabaseError(plain)).toBe(true)
     expect(isRefusal(plain)).toBe(false)
@@ -1041,6 +1042,93 @@ describe('round 10: driver text under a refusal, containers, APIError band, host
     // A viewer whose role throws is not-checked.
     const hostile = Object.defineProperty({ user: null }, 'role', { get: boom }) as unknown as Viewer
     expect((await runResponseDifferenceProbe({ identities: [hostile, closed], operations: [{ id: 'g', title: 'g', run: async () => 1 }] }))[0]!.status).toBe('not-checked')
+  })
+})
+
+describe('round 11: whole messages, isRefusal nesting, unreadable nested errors, cycles, integer status', () => {
+  const refusalText = 'This plugin needs transactions, and they are off.'
+  const run = (make: () => unknown, mode: 'start' | 'write' = 'start') =>
+    runTransactionCheck({
+      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r11', false) }),
+      write: async () => { throw make() },
+    })
+  const wrap = (extra: Record<string, unknown>, status = 403) => Object.assign(new Error(refusalText), { status }, extra)
+  const driverTexts = [
+    'writeConcern is not allowed within a multi-statement transaction', 'Cannot write to system collection config.foo within a transaction.',
+    'E11000 duplicate key error collection: app.users index: email_1 dup key: { email: "a@b.c" }', 'connection 3 to host-a:27017 closed', 'Unable to acquire server session',
+    'connection pool for host-a was cleared', 'MongoNetworkError: socket closed', 'not primary', 'Transaction failed', 'server selection timed out after 30000 ms',
+    'The operation was aborted by the server', 'Unable to roll back the changes', 'Topology was destroyed', 'cursor id 4 not found', 'Executor error during find command',
+    'Lock acquisition failed', 'Session expired', 'Your session has expired',
+  ]
+
+  it('1: driver text nested under a refusal, or after one in the same message, is never a pass', async () => {
+    for (const t of driverTexts) {
+      expect((await run(() => wrap({ cause: new Error(t) })))[0]!.status, `nested ${t}`).toBe('not-checked')
+      expect((await run(() => wrap({ errors: [{ message: t }] }), 'write'))[0]!.status, `bulk ${t}`).toBe('not-checked')
+      for (const head of ['This change needs a transaction, so it wasn\'t made. ', 'This plugin needs transactions: ', 'Forbidden - needs a transaction; ']) {
+        const e = Object.assign(new Error(head + t), { status: 403 })
+        expect((await run(() => e))[0]!.status, `top ${head}${t}`).toBe('not-checked')
+        expect((await run(() => e, 'write'))[0]!.status, `top write ${head}${t}`).toBe('not-checked')
+      }
+    }
+    // The plain refusal, and one with advice after it, still pass.
+    expect((await run(() => wrap({})))[0]!.status).toBe('pass')
+    expect((await run(() => Object.assign(new Error('This plugin needs transactions. Use a replica set.'), { status: 403 })))[0]!.status).toBe('pass')
+  })
+
+  it('2: isRefusal rejects a 403 that wraps a database error, in the back-door and host-rule checks too', async () => {
+    for (const t of ['E11000 duplicate key error collection: app.users', 'connection 3 to host-a:27017 closed', 'Unable to acquire server session']) {
+      for (const e of [Object.assign(new Error('Forbidden'), { status: 403, cause: new Error(t) }), Object.assign(new Error('Forbidden'), { status: 403, errors: [{ message: t }] })]) {
+        expect(isRefusal(e), t).toBe(false)
+        expect(isDatabaseError(e) || isDatabaseErrorMessage(t), t).toBe(true)
+      }
+      const crash = Object.assign(new Error('Forbidden'), { status: 403, cause: new Error(t) })
+      const [r] = await runResponseDifferenceProbe({ identities: [{ role: 'a' } as Viewer, { role: 'b' } as Viewer], operations: [{ id: 'z', title: 'z', run: async () => { throw crash } }] })
+      expect(r!.status, t).toBe('not-checked')
+    }
+    expect(isRefusal(Object.assign(new Error('Forbidden'), { status: 403, cause: new Error('You are not allowed to perform this action.') }))).toBe(true)
+  })
+
+  it('3: a nested error that cannot be read means not-checked', async () => {
+    const vm = await import('node:vm')
+    class Plain { message = refusalText }
+    const sym = { [Symbol('hidden')]: new Error('x'), message: refusalText }
+    const hidden = Object.defineProperty({ message: refusalText }, 'inner', { value: new Error('x'), enumerable: false })
+    const stackOnly = Object.defineProperty(new Error(''), 'stack', { value: 'MongoServerError: E11000' })
+    const things: Record<string, unknown> = {
+      objectMessage: { message: { text: 'x' } }, emptyMessage: new Error(''), codeOnly: { code: 999 }, stackOnly, symbolKey: sym, nonEnumerable: hidden,
+      classInstance: new Plain(), crossRealm: vm.runInNewContext('new Error("This plugin needs transactions, and they are off.")'), proxy: new Proxy(new Error(refusalText), {}),
+      graphqlForbidden: { extensions: { code: 'FORBIDDEN' } }, sessionExpired: new Error('Your session expired.'),
+    }
+    for (const [name, nested] of Object.entries(things)) {
+      for (const key of ['cause', 'errors']) {
+        const e = wrap({ [key]: key === 'errors' ? [nested] : nested })
+        expect((await run(() => e))[0]!.status, `${name} ${key}`).toBe('not-checked')
+        // A nested "session expired" is the plugin's own words for isRefusal; only the transaction check treats it as unknown.
+        if (name !== 'sessionExpired') expect(isRefusal(e), `${name} ${key} isRefusal`).toBe(false)
+      }
+    }
+  })
+
+  it('4: a self-referential array of width 30 finishes fast, and a huge array is not read to the end', () => {
+    const arr: unknown[] = []
+    for (let i = 0; i < 30; i++) arr.push(arr)
+    const e = Object.assign(new Error('Forbidden'), { status: 403, errors: arr })
+    const started = Date.now()
+    isRefusal(e)
+    isDatabaseError(e)
+    expect(Date.now() - started).toBeLessThan(1000)
+    const big = Object.assign(new Error('Forbidden'), { status: 403, errors: new Array(50_000).fill(new Error('Forbidden')) })
+    expect(isRefusal(big)).toBe(false)
+  })
+
+  it('5: a status counts only as a real integer number', async () => {
+    for (const status of ['403', 403n, [403], { valueOf: () => 403 }, 403.5, Number.NaN, true]) {
+      const e = Object.assign(new Error(refusalText), { status })
+      expect(isRefusal(e), String(status)).toBe(false)
+      expect((await run(() => e))[0]!.status, String(status)).toBe('not-checked')
+    }
+    expect(isRefusal(Object.assign(new Error('x'), { statusCode: 403 }))).toBe(true)
   })
 })
 
