@@ -308,7 +308,41 @@ const plainRefusalKeys = (error: object): boolean => {
   if (utilTypes.isProxy(error)) return false
   const keys = Reflect.ownKeys(error)
   const data = ownValue(error, 'data')
-  return keys.every((k) => typeof k === 'string' && (REFUSAL_OWN_KEYS.includes(k) || (k === 'cause' && 'value' in (Object.getOwnPropertyDescriptor(error, k) ?? {}) && ownValue(error, 'cause') === data)))
+  const namesOk = keys.every((k) => typeof k === 'string' && (REFUSAL_OWN_KEYS.includes(k) || (k === 'cause' && 'value' in (Object.getOwnPropertyDescriptor(error, k) ?? {}) && ownValue(error, 'cause') === data)))
+  if (!namesOk) return false
+  // Every own key is a plain data property (no getter) and its value has the right type, so a driver error can't ride inside one.
+  for (const k of keys as string[]) {
+    const d = Object.getOwnPropertyDescriptor(error, k)
+    // V8 keeps `stack` as an engine accessor; read it once and require text. Every other key must be a plain data property.
+    if (k === 'stack' && d && !('value' in d)) {
+      const st = (error as { stack?: unknown }).stack
+      if (typeof st !== 'string' && st !== undefined) return false
+      continue
+    }
+    if (!d || !('value' in d)) return false
+    const v = d.value
+    if (k === 'message' || k === 'stack' || k === 'name') {
+      if (typeof v !== 'string' && v !== undefined) return false // Payload's APIError sets stack to undefined
+    } else if (k === 'status' || k === 'statusCode') {
+      if (!Number.isInteger(v)) return false
+    } else if (k === 'isPublic' || k === 'isOperational') {
+      if (typeof v !== 'boolean') return false
+    }
+  }
+  // Two status fields that disagree read as unknown.
+  const status = ownValue(error, 'status')
+  const statusCode = ownValue(error, 'statusCode')
+  if (status !== undefined && statusCode !== undefined && status !== statusCode) return false
+  return true
+}
+/** `data` on a bare refusal: absent or null, or a plain object holding only plain values (text, numbers, booleans, null). Anything nested could hide a driver error. */
+const plainBareData = (data: unknown): boolean => {
+  if (data === undefined || data === null) return true
+  if (typeof data !== 'object' || utilTypes.isProxy(data) || Object.getPrototypeOf(data) !== Object.prototype) return false
+  return Reflect.ownKeys(data).every((k) => {
+    const d = Object.getOwnPropertyDescriptor(data, k)
+    return typeof k === 'string' && !!d && 'value' in d && (d.value === null || ['string', 'number', 'boolean'].includes(typeof d.value))
+  })
 }
 /**
  * A `data` that looks like an attempt at the marker but is not exactly it (any `refusal` key, even inherited, a Proxy,
@@ -358,7 +392,7 @@ export function isRefusal(error: unknown): boolean {
     if (typeof error !== 'object' || error === null || !plainRefusalKeys(error)) return false
     // The status is a plain own number here too (a getter can change its answer), and `data` may not claim to be a refusal.
     const status = ownValue(error, 'status') ?? ownValue(error, 'statusCode')
-    if (!REFUSAL_STATUSES.includes(intStatus(status)) || claimsRefusal(ownValue(error, 'data'))) return false
+    if (!REFUSAL_STATUSES.includes(intStatus(status)) || claimsRefusal(ownValue(error, 'data')) || !plainBareData(ownValue(error, 'data'))) return false
     // Anything nested (even a cycle back to itself), anything unreadable, or a driver's own fields means "unknown".
     const s = snapshot(error)
     return !s.unreadable && s.children.length === 0 && !ownDatabaseError(s)

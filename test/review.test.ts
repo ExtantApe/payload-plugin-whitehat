@@ -601,7 +601,7 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     const data = { refusal: TRANSACTIONS_REQUIRED }
     for (const status of [undefined, 500, '403', 403.5, 403n, [403], 401, 404, 400, NaN]) {
       const e = status === undefined ? Object.assign(new Error('x'), { data }) : Object.assign(new Error('x'), { status, data })
-      // 401 and 404 are bare refusals whatever data says, so only the other statuses must fail here.
+      // 401 and 404 with a data that claims `refusal` are not refusals either (claimsRefusal), but the loop only asserts the other statuses.
       if (status !== 401 && status !== 404) expect(isRefusal(e), String(status)).toBe(false)
     }
     expect(isRefusal(Object.assign(new Error('x'), { statusCode: 403, data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(false) // the marker needs `status`, and a bare statusCode may not claim the marker in data
@@ -673,6 +673,45 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     }
     expect(isRefusal(new Proxy(bare({}), {}))).toBe(false)
     expect(isRefusal(Object.assign(new Proxy({}, {}), { status: 403 }))).toBe(false)
+  })
+  it('own-key values are type-checked: a driver error inside data, isOperational, isPublic, stack, statusCode, message or name is not a refusal', () => {
+    const driver = Object.assign(new Error('E11000 duplicate key'), { name: 'MongoNetworkError', codeName: 'HostUnreachable' })
+    const pg = Object.assign(new Error('connection terminated'), { code: '57P01', severity: 'FATAL' })
+    for (const bad of [driver, pg]) {
+      for (const status of [401, 403, 404]) {
+        // bare path: the driver error sits in a listed key
+        for (const key of ['isOperational', 'isPublic', 'stack', 'statusCode', 'message', 'name']) {
+          expect(isRefusal(Object.assign(new Error('No'), { status, [key]: bad })), `${status} ${key}`).toBe(false)
+        }
+        expect(isRefusal(Object.assign(new Error('No'), { status, data: bad })), `${status} data`).toBe(false)
+        expect(isRefusal(Object.assign(new Error('No'), { status, data: { errors: [bad] } })), `${status} data.errors`).toBe(false)
+        expect(isRefusal(Object.assign(new Error('No'), { status, data: { inner: bad } })), `${status} data.inner`).toBe(false)
+      }
+      // marker path
+      for (const key of ['isOperational', 'isPublic', 'stack', 'statusCode', 'message', 'name']) {
+        expect(isRefusal(Object.assign(marker(), { [key]: bad })), `marker ${key}`).toBe(false)
+      }
+    }
+    // wrong primitive types too
+    for (const [key, v] of Object.entries({ isOperational: 'true', isPublic: 1, stack: 5, message: 7, name: {}, statusCode: '403' })) {
+      expect(isRefusal(Object.assign(marker(), { [key]: v })), `marker ${key}`).toBe(false)
+      expect(isRefusal(Object.assign(new Error('No'), { status: 403, [key]: v })), `bare ${key}`).toBe(false)
+    }
+    // plain values are fine, and data may be absent or a plain object of plain values
+    expect(isRefusal(marker(REFUSAL, { isOperational: true, isPublic: false }))).toBe(true)
+    expect(isRefusal(Object.assign(new Error('No'), { status: 403, isOperational: true, isPublic: false, data: { reason: 'x' } }))).toBe(true)
+    expect(isRefusal(Object.assign(new Error('No'), { status: 404 }))).toBe(true)
+  })
+  it('two status fields that disagree, or a status getter, read as unknown', () => {
+    expect(isRefusal(Object.assign(new Error('x'), { status: 403, statusCode: 500 }))).toBe(false)
+    expect(isRefusal(Object.assign(new Error('x'), { status: 500, statusCode: 403 }))).toBe(false)
+    expect(isRefusal(Object.assign(new Error('x'), { status: 403, statusCode: 404 }))).toBe(false)
+    expect(isRefusal(Object.assign(marker(), { statusCode: 500 }))).toBe(false)
+    expect(isRefusal(Object.assign(new Error('x'), { status: 403, statusCode: 403 }))).toBe(true)
+    const getter500 = Object.defineProperty(Object.assign(new Error('x'), { statusCode: 403 }), 'status', { get: () => 500, enumerable: true })
+    expect(isRefusal(getter500)).toBe(false)
+    const getter403 = Object.defineProperty(Object.assign(new Error('x'), { status: 403 }), 'statusCode', { get: () => 500, enumerable: true })
+    expect(isRefusal(getter403)).toBe(false)
   })
   it('a refusal option of the wrong type is a config error, not a quiet not-checked', async () => {
     for (const bad of [/403/, 'forbidden', 42, null, {}]) {

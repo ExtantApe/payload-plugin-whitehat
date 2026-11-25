@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-24 (round 14): values in the allow-list, conflicting statuses
+
+Suite: 116 tests after (`npx vitest run`). Round 12 and 13 entries below stay as written; round 13's `TransactionsRequired` class tests were removed in round 13.
+
+- **Covered.** A driver error (a Mongo-shaped and a pg-shaped one) inside `isOperational`, `isPublic`, `stack`, `statusCode`, `message` or `name` is not a refusal on the bare path at 401, 403 and 404 and on the marker path; so is one in `data`, `data.errors` or `data.inner` on the bare path. Wrong primitive types in each of those keys are not refusals. Plain values and a `data` of plain values still pass. `status` beside a different `statusCode` (both orders, and on the marker) and a `status` or `statusCode` getter are unknown. A test comment that said 401 and 404 are refusals whatever `data` says was corrected.
+- **Gaps.** The three host plugins' own throws belong in those repos.
+- **Skipped.** Nothing new.
+
 ## 2026-11-24 (round 13): the settled marker, the own-key allow-list, the option type
 
 Suite: 114 tests after (`npx vitest run`; real Payload 3.92 and in-memory MongoDB). The fixture now throws the marker through Payload's `APIError`, so the transactions checks run it end to end.
@@ -14,7 +22,7 @@ Suite: 114 tests after (`npx vitest run`; real Payload 3.92 and in-memory MongoD
 
 Suite: 107 tests after (`npx vitest run`; real Payload 3.92 and in-memory MongoDB). The round 4 to 11 tests that probed text wording were removed with the rules they tested (the sentence splitter, cue words, driver deny-list and name list).
 
-- **Covered.** The marker (then the `TransactionsRequired` class) passes, with any message and also as a copy carrying `data.refusal`; a wrong `data.refusal` does not. A bare 401, 403 and 404 pass by `status` and `statusCode`. Sixteen made-up driver and refusal texts (as a plain Error, a string, a bare object, under a 403 as `cause`, as a string cause and in an `errors` list, and a refusal sentence followed by driver text) are not refusals. Forbidden, UnauthorizedError, NotFound and APIError at ten other statuses are not refusals. Non-integer statuses ('403', 403n, [403], 403.5, NaN, a `valueOf` object) are not. A 403 with a nested `cause`, `originalError`, `errorResponse` or `writeErrors` is not. A driver error with a 403 is not. Throwing getters on `cause`, `errors`, `name`, `code`, `codeName`, `status` and `data`, and a cycle, read as not a refusal and do not crash. The transactions check passes on the marker and on a bare 403, is not-checked on every text, and a custom `refusal` never rescues a driver error. Bulk entries with only a message are not-checked, and with a status they pass.
+- **Covered.** The `TransactionsRequired` marker passes, with any message and also as a copy carrying `data.refusal`; a wrong `data.refusal` does not. A bare 401, 403 and 404 pass by `status` and `statusCode`. Sixteen made-up driver and refusal texts (as a plain Error, a string, a bare object, under a 403 as `cause`, as a string cause and in an `errors` list, and a refusal sentence followed by driver text) are not refusals. Forbidden, UnauthorizedError, NotFound and APIError at ten other statuses are not refusals. Non-integer statuses ('403', 403n, [403], 403.5, NaN, a `valueOf` object) are not. A 403 with a nested `cause`, `originalError`, `errorResponse` or `writeErrors` is not. A driver error with a 403 is not. Throwing getters on `cause`, `errors`, `name`, `code`, `codeName`, `status` and `data`, and a cycle, read as not a refusal and do not crash. The transactions check passes on the marker and on a bare 403, is not-checked on every text, and a custom `refusal` never rescues a driver error. Bulk entries with only a message are not-checked, and with a status they pass.
 - **Gaps.** The organizations, positions and sharing plugins need their own one-line throw; their tests belong in those repos.
 - **Skipped.** Real driver messages on a live server: the rule no longer reads text, so wording has nothing left to test. The one real WriteConflict test still runs.
 
