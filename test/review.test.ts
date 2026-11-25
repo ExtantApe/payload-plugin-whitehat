@@ -1,10 +1,10 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoClient } from 'mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
-import { APIError, BasePayload, buildConfig, type Payload } from 'payload'
+import { APIError, AuthenticationError, BasePayload, buildConfig, Forbidden, LockedAuth, NotFound, UnverifiedEmail, ValidationError, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { HOST_ANSWERS, TRANSACTIONS_REQUIRED, TransactionsRequired, isDatabaseError, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
+import { HOST_ANSWERS, TRANSACTIONS_REQUIRED, isDatabaseError, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
 import { fixturePlugin, state } from './fixtures/fixturePlugin.js'
 import { closeAll } from './helpers/mongo.js'
 
@@ -562,6 +562,8 @@ describe('interface strings', () => {
   })
 })
 
+const marker = (message = 'This change needs a transaction, so it wasn’t made.', extra: Record<string, unknown> = {}) => Object.assign(new APIError(message, 403, { refusal: 'transactions-required' }), extra)
+
 describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothing else', () => {
   // Fixture texts in the spirit of the round 8 to 11 probes: generic public driver wording, made up, never read by the rule.
   const REFUSAL = 'This change needs a transaction, so it wasn’t made.'
@@ -584,15 +586,105 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     `${REFUSAL} E11000 duplicate key error`,
   ]
 
-  it('the exported marker is a refusal, with a fixed data.refusal', () => {
-    const e = new TransactionsRequired()
+  it('the marker a plugin throws itself, with Payload’s APIError, is a refusal', () => {
+    const e = marker()
     expect(e).toBeInstanceOf(Error)
     expect(e.data).toEqual({ refusal: 'transactions-required' })
     expect(isRefusal(e)).toBe(true)
-    expect(isRefusal(new TransactionsRequired('Anything else the plugin wants to say.'))).toBe(true)
-    // A copy from another build of the package still counts, since the value is what is trusted.
-    expect(isRefusal(Object.assign(new Error('x'), { data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(true)
-    expect(isRefusal(Object.assign(new Error('x'), { data: { refusal: 'something-else' } }))).toBe(false)
+    expect(isRefusal(marker('Anything else the plugin wants to say.'))).toBe(true)
+    expect(isRefusal(marker(REFUSAL, { isPublic: false }))).toBe(true)
+    // A plain object copy of the same shape counts too, since the shape is what is trusted.
+    expect(isRefusal(Object.assign(new Error('x'), { status: 403, data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(true)
+    expect(isRefusal(Object.assign(new Error('x'), { status: 403, data: { refusal: 'something-else' } }))).toBe(false)
+  })
+  it('the marker needs status 403 as a plain own number', () => {
+    const data = { refusal: TRANSACTIONS_REQUIRED }
+    for (const status of [undefined, 500, '403', 403.5, 403n, [403], 401, 404, 400, NaN]) {
+      const e = status === undefined ? Object.assign(new Error('x'), { data }) : Object.assign(new Error('x'), { status, data })
+      // 401 and 404 are bare refusals whatever data says, so only the other statuses must fail here.
+      if (status !== 401 && status !== 404) expect(isRefusal(e), String(status)).toBe(false)
+    }
+    expect(isRefusal(Object.assign(new Error('x'), { statusCode: 403, data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(false) // the marker needs `status`, and a bare statusCode may not claim the marker in data
+    const getter = Object.defineProperty(new Error('x'), 'status', { get: () => 403, enumerable: true })
+    expect(isRefusal(Object.assign(getter, { data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(false)
+    const flip = Object.defineProperty(new Error('x'), 'status', { get: () => 403 })
+    expect(isRefusal(flip)).toBe(false)
+    // The marker's status cannot come from the prototype either.
+    const inherited = Object.assign(Object.create({ status: 403 }) as Error, { message: 'x', data: { refusal: TRANSACTIONS_REQUIRED } })
+    expect(isRefusal(inherited)).toBe(false)
+  })
+  it('the marker needs data to be exactly a plain { refusal: "transactions-required" }', () => {
+    class D { refusal = TRANSACTIONS_REQUIRED }
+    const inheritedRefusal = Object.create({ refusal: TRANSACTIONS_REQUIRED }) as object
+    const nullProto = Object.assign(Object.create(null) as object, { refusal: TRANSACTIONS_REQUIRED })
+    const withSymbol = { refusal: TRANSACTIONS_REQUIRED, [Symbol('k')]: 1 }
+    const getterData = Object.defineProperty({}, 'refusal', { get: () => TRANSACTIONS_REQUIRED, enumerable: true })
+    const bad: unknown[] = [
+      new D(), new Proxy({ refusal: TRANSACTIONS_REQUIRED }, {}), [TRANSACTIONS_REQUIRED], Object.assign([], { refusal: TRANSACTIONS_REQUIRED }), nullProto,
+      { refusal: TRANSACTIONS_REQUIRED, extra: 1 }, { refusal: TRANSACTIONS_REQUIRED, errors: [] }, inheritedRefusal, withSymbol, getterData,
+      { refusal: 'Transactions-Required' }, { refusal: ['transactions-required'] }, null, undefined, 'transactions-required', TRANSACTIONS_REQUIRED,
+      new Map([['refusal', TRANSACTIONS_REQUIRED]]),
+    ]
+    // Null, undefined and a string are skipped: a bare 403 with no data is a refusal on its own. Everything else must fail.
+    for (const [i, data] of bad.entries()) {
+      if (data === null || data === undefined || typeof data === 'string') continue
+      expect(isRefusal(Object.assign(new Error('x'), { status: 403, data })), `data ${i}`).toBe(false)
+    }
+  })
+  it('the marker with a nested error beside it (cause, errors, others) is not a refusal', () => {
+    const data = { refusal: TRANSACTIONS_REQUIRED }
+    const withKey = (extra: Record<string, unknown>) => Object.assign(marker(), extra)
+    expect(isRefusal(marker())).toBe(true) // cause === data, as Payload sets it
+    expect(isRefusal(withKey({ cause: new Error('E11000 duplicate key') }))).toBe(false)
+    expect(isRefusal(withKey({ cause: { ...data } }))).toBe(false)
+    expect(isRefusal(withKey({ cause: undefined }))).toBe(false)
+    expect(isRefusal(withKey({ errors: [] }))).toBe(false)
+    expect(isRefusal(withKey({ errors: [{ message: 'x' }] }))).toBe(false)
+    for (const k of ['originalError', 'errorResponse', 'writeErrors', 'extra', 'code', 'details']) expect(isRefusal(withKey({ [k]: 1 })), k).toBe(false)
+    expect(isRefusal(withKey({ [Symbol('s')]: 1 }))).toBe(false)
+    const inheritedErrors = Object.assign(Object.create({ errors: [new Error('x')] }) as Error, { message: 'x', status: 403, data })
+    expect(isRefusal(inheritedErrors)).toBe(false)
+    expect(isRefusal(new Proxy(marker(), {}))).toBe(false)
+  })
+  it('the marker on a validation error or a Mongo error is not a refusal', () => {
+    const data = { refusal: TRANSACTIONS_REQUIRED }
+    expect(isRefusal(Object.assign(marker(), { name: 'ValidationError' }))).toBe(false)
+    expect(isRefusal(Object.assign(new ValidationError({ collection: 'notes', errors: [{ message: 'x', path: 'title' }] }), { status: 403, data }))).toBe(false)
+    expect(isRefusal(Object.assign(marker(), { name: 'MongoServerError' }))).toBe(false)
+    expect(isRefusal(Object.assign(marker(), { code: 251, codeName: 'NoSuchTransaction' }))).toBe(false)
+    expect(isRefusal(Object.assign(marker(), { errorLabels: ['TransientTransactionError'] }))).toBe(false)
+    expect(isRefusal(Object.assign(marker(), { name: 'NoSuchTransaction' }))).toBe(false)
+    expect(isRefusal(Object.assign(new Error('x'), { name: 'MongoServerError', code: 251, codeName: 'NoSuchTransaction', status: 403, data }))).toBe(false)
+  })
+  it('a bare 401, 403 or 404 with an unlisted key, a Map or Set subclass, a Proxy array or a symbol is not a refusal', () => {
+    class LyingMap extends Map<unknown, unknown> { override get size() { return 0 } override values() { return [][Symbol.iterator]() as never } override [Symbol.iterator]() { return [][Symbol.iterator]() as never } }
+    class LyingSet extends Set<unknown> { override get size() { return 0 } override [Symbol.iterator]() { return [][Symbol.iterator]() as never } override values() { return [][Symbol.iterator]() as never } }
+    const lyingMap = new LyingMap([['a', new Error('E11000')]])
+    const lyingSet = new LyingSet([new Error('E11000')])
+    const proxyArray = new Proxy([new Error('E11000 duplicate key')], {})
+    const lyingArray = new Proxy([], { get: (t, k) => (k === 'length' ? 0 : Reflect.get(t, k)) })
+    const bare = (extra: Record<PropertyKey, unknown>, status = 403) => Object.assign(new Error('No'), { status }, extra)
+    for (const status of [401, 403, 404]) {
+      expect(isRefusal(bare({}, status))).toBe(true)
+      for (const [name, extra] of Object.entries({ lyingMap: { nested: lyingMap }, lyingSet: { nested: lyingSet }, proxyArray: { inner: proxyArray }, lyingArray: { inner: lyingArray }, deep: { a: { b: { c: new Error('x') } } }, details2: { whatever: [new Error('x')] }, fn: { fn: () => 1 } })) {
+        expect(isRefusal(bare(extra, status)), `${status} ${name}`).toBe(false)
+      }
+      expect(isRefusal(bare({ [Symbol('s')]: new Error('x') }, status))).toBe(false)
+    }
+    expect(isRefusal(new Proxy(bare({}), {}))).toBe(false)
+    expect(isRefusal(Object.assign(new Proxy({}, {}), { status: 403 }))).toBe(false)
+  })
+  it('a refusal option of the wrong type is a config error, not a quiet not-checked', async () => {
+    for (const bad of [/403/, 'forbidden', 42, null, {}]) {
+      await expect(runTransactionCheck({ start: async () => { throw marker() }, write: async () => undefined, refusal: bad as never })).rejects.toThrow(/config error.*"refusal"/)
+    }
+    await expect(runTransactionCheck({ start: async () => { throw marker() }, write: async () => undefined, refusal: () => true })).resolves.toBeTruthy()
+  })
+  it('a real APIError is read by its own keys: Forbidden, NotFound and the auth errors are bare refusals', () => {
+    const t = (_k: string) => 'x'
+    for (const e of [new Forbidden(), new NotFound(t as never), new AuthenticationError(t as never), new LockedAuth(t as never), new UnverifiedEmail({ t: t as never })]) expect(isRefusal(e), e.name).toBe(true)
+    expect(isRefusal(new APIError('x', 403, { reason: 'x' }))).toBe(false)
+    expect(isRefusal(new APIError('x', 500))).toBe(false)
   })
   it('a bare 401, 403 or 404 is a refusal, by status or statusCode', () => {
     for (const status of [401, 403, 404]) {
@@ -645,7 +737,7 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
   })
   it('the transactions check passes on the marker and on a bare 403, and is not-checked on any text', async () => {
     const at = (thrown: unknown) => runTransactionCheck({ start: async () => { throw thrown }, write: async () => undefined })
-    expect((await at(new TransactionsRequired()))[0]).toMatchObject({ status: 'pass', path: 'start-up' })
+    expect((await at(marker()))[0]).toMatchObject({ status: 'pass', path: 'start-up' })
     expect((await at(Object.assign(new Error('x'), { status: 403 })))[0]).toMatchObject({ status: 'pass' })
     for (const t of DRIVER_TEXTS) {
       expect((await at(new Error(t)))[0]!.status, t).toBe('not-checked')
@@ -657,7 +749,7 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     expect((await runTransactionCheck({ start: async () => { throw Object.assign(new Error('x'), { codeName: 'NoSuchTransaction' }) }, write: async () => undefined, ...own }))[0]!.status).toBe('not-checked')
   })
   it('a probe that throws the marker is a refusal in the difference probe and in the host rule check', async () => {
-    const refused = async () => { throw new TransactionsRequired() }
+    const refused = async () => { throw marker() }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'm', title: 'm', run: refused }] }))[0]!.status).toBe('pass')
     const texty = async () => { throw new Error(REFUSAL) }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 't', title: 't', run: texty }] }))[0]!.status).toBe('not-checked')

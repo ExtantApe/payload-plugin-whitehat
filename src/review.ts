@@ -270,7 +270,8 @@ export function isDatabaseError(error: unknown): boolean {
  * errors that pass it.
  */
 function guardRefusal(custom: ((error: unknown) => boolean) | undefined): (error: unknown) => boolean {
-  if (!custom) return isRefusal
+  if (custom === undefined) return isRefusal
+  if (typeof custom !== 'function') throw new Error(`config error: option "isRefusal" must be a function that takes the error, not ${custom === null ? 'null' : typeof custom}.`)
   return (error) => {
     try {
       return !isDatabaseError(error) && custom(error)
@@ -291,37 +292,73 @@ export function isValidationError(error: unknown): boolean {
 }
 /** The fixed value of `data.refusal` on the error a plugin throws when it refuses to run without transactions. */
 export const TRANSACTIONS_REQUIRED = 'transactions-required'
-/**
- * The one error a plugin throws to say "this needs transactions, so I won't run". Whitehat trusts this marker and
- * nothing a message says. The shape (class name, `data.refusal` and its value) is open to the Head of Tools.
- */
-export class TransactionsRequired extends Error {
-  readonly data = { refusal: TRANSACTIONS_REQUIRED } as const
-  constructor(message = 'This needs database transactions, and they are off.') {
-    super(message)
-    this.name = 'TransactionsRequired'
-  }
+/** The only own keys a refusal error may have. `cause` is also allowed, but only when it is the very same value as `data`. */
+const REFUSAL_OWN_KEYS = ['message', 'stack', 'name', 'status', 'statusCode', 'data', 'isPublic', 'isOperational']
+
+/** The value of an own data property, or undefined for a getter, a missing key or anything that throws. */
+const ownValue = (o: object, key: string): unknown => {
+  const d = Object.getOwnPropertyDescriptor(o, key)
+  return d && 'value' in d ? d.value : undefined
 }
+/**
+ * The own-key allow-list: no Proxy, no symbol keys, and every own key is one of REFUSAL_OWN_KEYS, or `cause` when it
+ * is `data` itself (Payload's APIError sets `cause: data`). Anything else may carry a nested error, so it is unknown.
+ */
+const plainRefusalKeys = (error: object): boolean => {
+  if (utilTypes.isProxy(error)) return false
+  const keys = Reflect.ownKeys(error)
+  const data = ownValue(error, 'data')
+  return keys.every((k) => typeof k === 'string' && (REFUSAL_OWN_KEYS.includes(k) || (k === 'cause' && 'value' in (Object.getOwnPropertyDescriptor(error, k) ?? {}) && ownValue(error, 'cause') === data)))
+}
+/**
+ * A `data` that looks like an attempt at the marker but is not exactly it (any `refusal` key, even inherited, a Proxy,
+ * or anything that is not a plain object) makes a bare status ambiguous, so it is not a refusal. No data, or a plain
+ * object with no `refusal` key, is fine.
+ */
+const claimsRefusal = (data: unknown): boolean => {
+  if (data === undefined || data === null) return false
+  if (typeof data !== 'object') return false
+  if (utilTypes.isProxy(data) || Object.getPrototypeOf(data) !== Object.prototype) return true
+  return 'refusal' in data
+}
+/**
+ * The marker a plugin throws itself, with no import from whitehat:
+ * `new APIError('This change needs a transaction, so it wasn’t made.', 403, { refusal: 'transactions-required' })`.
+ * It is `status` 403 as a plain own number, a `data` that is a plain object (prototype Object.prototype) whose own
+ * keys are exactly ['refusal'] with that value, `cause` absent or `data`, no `errors`, and nothing else on the error.
+ */
 const hasMarker = (error: unknown): boolean => {
   try {
-    if (typeof error !== 'object' || error === null) return false
-    const data = (error as { data?: unknown }).data
-    return typeof data === 'object' && data !== null && (data as { refusal?: unknown }).refusal === TRANSACTIONS_REQUIRED
+    if (typeof error !== 'object' || error === null || !plainRefusalKeys(error)) return false
+    if (ownValue(error, 'status') !== 403) return false
+    const data = ownValue(error, 'data')
+    if (typeof data !== 'object' || data === null || utilTypes.isProxy(data) || Object.getPrototypeOf(data) !== Object.prototype) return false
+    const keys = Reflect.ownKeys(data)
+    if (keys.length !== 1 || keys[0] !== 'refusal' || ownValue(data, 'refusal') !== TRANSACTIONS_REQUIRED) return false
+    if ((error as { errors?: unknown }).errors !== undefined || 'errors' in error) return false
+    // A driver or validation error never counts, whatever it carries.
+    const s = snapshot(error)
+    return !s.unreadable && !ownDatabaseError(s) && String(s.name) !== 'ValidationError'
   } catch {
     return false
   }
 }
 /**
- * Whether an error is a refusal. Only two things count: the `TransactionsRequired` marker (`data.refusal` of
- * 'transactions-required'), or an exact integer `status` or `statusCode` of 401, 403 or 404 with no nested error
- * (`cause`, `errors` ...) and no database-driver fields. Nothing is judged by its message or name: a 'Forbidden' or
- * 'NotFound' at any other status, a plain Error and every text are not refusals, and neither is a validation error.
+ * Whether an error is a refusal. Only two things count: the marker (see `hasMarker`: a 403 with
+ * `data` of exactly `{ refusal: 'transactions-required' }`), or a bare error: an exact integer `status` or
+ * `statusCode` of 401, 403 or 404, own keys only from the allow-list (no nested error under any other key, no
+ * Proxy) and no database-driver fields. Nothing is judged by its message or name: a 'Forbidden' or 'NotFound' at any
+ * other status, a plain Error and every text are not refusals, and neither is a validation error. A NotFound (404),
+ * AuthenticationError (401), LockedAuth and UnverifiedEmail (403) count as refusals like any other bare 401, 403 or 404.
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
   try {
     if (hasMarker(error)) return true
-    if (typeof error !== 'object' || error === null || !REFUSAL_STATUSES.includes(statusOf(error))) return false
+    if (typeof error !== 'object' || error === null || !plainRefusalKeys(error)) return false
+    // The status is a plain own number here too (a getter can change its answer), and `data` may not claim to be a refusal.
+    const status = ownValue(error, 'status') ?? ownValue(error, 'statusCode')
+    if (!REFUSAL_STATUSES.includes(intStatus(status)) || claimsRefusal(ownValue(error, 'data'))) return false
     // Anything nested (even a cycle back to itself), anything unreadable, or a driver's own fields means "unknown".
     const s = snapshot(error)
     return !s.unreadable && s.children.length === 0 && !ownDatabaseError(s)
@@ -536,8 +573,8 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
  *   as is a guard that reads `req.transactionID` without awaiting it.
  *
  * `refusal` replaces `isRefusal` where the site refuses some other way: it gets the error, and a database error is never a
- * refusal whatever it says. By default only the `TransactionsRequired` marker or a bare 401, 403 or 404 counts (see
- * `isRefusal`). Any other error, text included, is "not-checked".
+ * refusal whatever it says. By default only the marker or a bare 401, 403 or 404 counts (see
+ * `isRefusal`). Any other error, text included, is "not-checked". A `refusal` that is not a function is a config error.
  */
 export async function runTransactionCheck(input: {
   start: () => Promise<{ payload: Payload; stop?: () => Promise<void> }>
@@ -547,6 +584,7 @@ export async function runTransactionCheck(input: {
   refusal?: (error: unknown) => boolean
   severity?: Severity
 }): Promise<Finding[]> {
+  if (input.refusal !== undefined && typeof input.refusal !== 'function') throw new Error(`runTransactionCheck config error: option "refusal" must be a function that takes the error, not ${input.refusal === null ? 'null' : typeof input.refusal === 'object' ? Object.prototype.toString.call(input.refusal) : typeof input.refusal}.`)
   const sev = input.severity ?? 'high'
   const mode = input.mode ?? 'off-at-start'
   const check = 'transactions-required'
