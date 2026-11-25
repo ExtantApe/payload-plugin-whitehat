@@ -247,7 +247,7 @@ function snapshot(node: unknown): Snap {
       snap.own = message
       snap.text = message
     } else if (message !== undefined && message !== null) snap.text = prim(message)
-    else snap.text = Object.prototype.toString.call(node)
+    else snap.text = '' // no message: never ask the error for its Symbol.toStringTag (that is a getter call)
     const d = get('data')
     if (d !== undefined && d !== null) {
       if (plainJson(d)) {

@@ -45,6 +45,8 @@ A refusal is exactly one of two things.
 
 A custom `refusal` or `isRefusal` function is the caller's own rule, but a database error is tested first and is never rescued by it. It must be a function: any other type (a RegExp, a string) is a config error and throws, instead of turning results into not-checked. Any other error, transactions that turn out to be on, or a `beginTransaction` that throws, is `not-checked`.
 
+**Round 18 (2026-11-24, Simon's review of round 17).** An error with no message no longer gets its text from `Object.prototype.toString`, which reads `Symbol.toStringTag` through an ordinary lookup and so ran an own or inherited accessor. The text is empty instead. No verdict used that text. The only getter that runs is still V8's `stack`.
+
 **Round 17 (2026-11-24, Simon's review of round 16).** An error is read once, from property descriptors only (own, then down the prototype chain), and every check judges that snapshot and never touches the live error again. The only getter that runs is V8's `stack`, read first. Any other accessor, or a Proxy, reads as unknown, which is not a refusal and counts as a possible database error. Text conversion is only for primitives, so an object's `toString` and `toJSON` are never called. The marker shape is unchanged.
 
 **Round 16 (2026-11-24, Simon's review of round 15).** `stack` is read first and once, before the inheritance check and the key list. A `stack` getter that adds `originalError`, as an own key or through `setPrototypeOf`, can no longer slip past. (Round 16 did not cover inherited getters on `code`, `codeName`, `errmsg` and `errorLabels`; round 17 does.)

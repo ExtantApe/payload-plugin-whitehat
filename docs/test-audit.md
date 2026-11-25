@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-24 (round 18): no toStringTag read
+
+Suite: 123 plus 1 new test (124, `npx vitest run`). The new test fails on 6a46540.
+
+- **Covered.** An own or inherited `Symbol.toStringTag` getter on an error with no message, on a nested cause and on an array never runs through `isRefusal`, `isValidationError`, `isDatabaseError` and `isTransactionError`; the `{ status: 500 }` probe is not a refusal.
+- **Gaps.** Real driver errors on a live server and the three host plugins' own throws belong elsewhere.
+- **Skipped.** `statusOf` and the other callers go through these four, so they are not tested separately.
+
 ## 2026-11-24 (round 17): one descriptor-only snapshot
 
 Suite: 121 plus 2 new tests (123, `npx vitest run`). Both fail on 31f1b8f.

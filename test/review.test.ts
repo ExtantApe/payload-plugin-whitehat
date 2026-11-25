@@ -870,6 +870,21 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     const texty = async () => { throw new Error(REFUSAL) }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 't', title: 't', run: texty }] }))[0]!.status).toBe('not-checked')
   })
+  it('a Symbol.toStringTag getter, own or inherited, never runs', () => {
+    let ran = 0
+    const getter = { get: () => { ran++; return 'Tagged' }, configurable: true }
+    const own = Object.defineProperty({ status: 500 } as Record<string, unknown>, Symbol.toStringTag, getter)
+    const inherited = Object.create(Object.defineProperty({}, Symbol.toStringTag, getter)) as Record<string, unknown>
+    inherited.status = 500
+    const ownNoStatus = Object.defineProperty({} as Record<string, unknown>, Symbol.toStringTag, getter)
+    const nested = Object.defineProperty({}, Symbol.toStringTag, getter)
+    for (const e of [own, inherited, ownNoStatus, { status: 403, cause: nested }, [nested], Object.assign(new Error(), { message: undefined, status: 403 })]) {
+      for (const judge of [isRefusal, isValidationError, isDatabaseError, isTransactionError]) judge(e)
+    }
+    expect(ran).toBe(0)
+    expect(isRefusal(own)).toBe(false)
+    expect(isRefusal(inherited)).toBe(false)
+  })
   it('the removed text rules are gone from the package', async () => {
     const { readFileSync } = await import('node:fs')
     const src = readFileSync(new URL('../src/review.ts', import.meta.url), 'utf8')
