@@ -4,7 +4,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { APIError, AuthenticationError, BasePayload, buildConfig, Forbidden, LockedAuth, NotFound, UnverifiedEmail, ValidationError, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { HOST_ANSWERS, TRANSACTIONS_REQUIRED, isDatabaseError, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
+import { HOST_ANSWERS, TRANSACTIONS_REQUIRED, isDatabaseError, isRefusal, isTransactionError, isValidationError, runContextLeakCheck, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
 import { fixturePlugin, state } from './fixtures/fixturePlugin.js'
 import { closeAll } from './helpers/mongo.js'
 
@@ -37,6 +37,7 @@ const reset = () => {
   state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = state.looseVeto = state.trueOnlyVeto = state.silentLock = state.crash = false
   state.host = {}
   state.transactions = 'ignored'
+  state.contextLeak = 'off'
 }
 const user = async (email: string, extra: Record<string, unknown> = {}): Promise<Viewer & { id: string }> => {
   const u = (await payload.create({ collection: 'users', data: { email: `${email}@example.invalid`, password: 'correct-horse-battery', ...extra } as never })) as unknown as { id: string }
@@ -900,5 +901,33 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     const src = readFileSync(new URL('../src/review.ts', import.meta.url), 'utf8')
     for (const gone of ['REFUSAL_CUE', 'REFUSAL_ADVICE', 'everySentenceRefuses', 'DATABASE_MESSAGE', 'isDatabaseErrorMessage', 'databaseMessageIn', 'REFUSAL_NAMES']) expect(src.includes(gone), gone).toBe(false)
     expect(await import('../src/index.js')).not.toHaveProperty('isDatabaseErrorMessage')
+  })
+})
+
+describe('6. flags left on the caller’s req.context (K768)', () => {
+  const bulk = async () => {
+    for (const t of ['one', 'two']) await payload.create({ collection: 'notes' as never, data: { title: t, owner: `ctx-${owner.id}` } as never, overrideAccess: true })
+    return runContextLeakCheck({ payload, operation: (req) => payload.update({ collection: 'notes' as never, where: { owner: { equals: `ctx-${owner.id}` } }, data: { title: 'changed' } as never, overrideAccess: true, req }) })
+  }
+  it('fires when a hook passes context with the shared req, and names the key', async () => {
+    state.contextLeak = 'leaky'
+    const [f] = await bulk()
+    expect(f).toMatchObject({ status: 'fail', severity: 'high', check: 'context-flag-leak' })
+    expect(f!.how).toContain('skipNoteLock added')
+    expect(f!.how).not.toContain('whitehatContextProbe')
+  })
+  it('stays quiet when the hook isolates req.context, or sets no context', async () => {
+    state.contextLeak = 'isolated'
+    expect((await bulk())[0]).toMatchObject({ status: 'pass' })
+    state.contextLeak = 'off'
+    expect((await bulk())[0]).toMatchObject({ status: 'pass' })
+  })
+  it('ignores keys the caller lists, and is not-checked when the operation throws', async () => {
+    const set = await runContextLeakCheck({ payload, ignore: ['hostFlag'], operation: async (req) => void (req.context.hostFlag = 1) })
+    expect(set[0]).toMatchObject({ status: 'pass' })
+    const removed = await runContextLeakCheck({ payload, operation: async (req) => void delete req.context.whitehatContextProbe })
+    expect(removed[0]!.how).toContain('whitehatContextProbe removed')
+    const threw = await runContextLeakCheck({ payload, operation: async () => { throw new Error('boom') } })
+    expect(threw[0]).toMatchObject({ status: 'not-checked' })
   })
 })

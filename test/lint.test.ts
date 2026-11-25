@@ -39,6 +39,16 @@ describe('5. static lint', () => {
     const other = "const a = async (req) => {\n  await req.payload.findByID({ collection: 'a', id, req })\n}\nconst b = async (req) => {\n  await req.payload.find({ collection: 'x', req })\n}"
     expect(hits(other)).toEqual(['paginated-find-in-transaction hook.ts:5'])
   })
+  it('K768: flags context passed with the shared req, and stays quiet when req is isolated', () => {
+    const h = (call: string, pre = '') => `${pre}export const hook = async ({ req }) => {\n  ${call}\n}`
+    expect(hits(h("await req.payload.update({ collection: 'x', id, data, context: { skipHooks: true }, req })"))).toEqual(['context-on-shared-req hook.ts:2'])
+    expect(hits(h("await req.payload.create({ collection: 'x', data, req: args.req, context })"))).toEqual(['context-on-shared-req hook.ts:2'])
+    expect(hits(h("await req.payload.update({ collection: 'x', id, data, context: { skipHooks: true }, req: isolateObjectProperty(req, ['context']) })"))).toEqual([])
+    expect(hits(h("await payload.update({ collection: 'x', id, data, context: { skipHooks: true }, req: inner })"))).toEqual([])
+    expect(hits(h("await req.payload.update({ collection: 'x', id, data, req })"))).toEqual([])
+    expect(hits(h("await req.payload.update({ collection: 'x', id, data, context: { skip: true } })"))).toEqual([])
+    expect(hits("export const hook = async (args) => {\n  const req = isolateObjectProperty(args.req, ['context'])\n  await req.payload.update({ collection: 'x', id, data, context: { skip: true }, req })\n}")).toEqual([])
+  })
   it('keeps line numbers across comments', () => {
     const s = stripComments('a\n/* one\ntwo */\nb // tail\nc')
     expect(s.split('\n')).toHaveLength(5)

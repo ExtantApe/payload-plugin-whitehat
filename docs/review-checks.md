@@ -1,11 +1,11 @@
 # Review-finding checks
 
-Five checks for classes of bug that human security review keeps finding in Payload plugins. They are plain functions a plugin repo runs in its own Vitest suite or CI against a Payload instance. Like the rest of Whitehat they report and never fix, and findings carry a severity. The probes do write: they try to create, change and delete rows in the collections you name, and a probe that gets through leaves its change behind, so run them on a throwaway database with made-up users and records (the in-memory MongoDB the plugin's own tests use is the usual choice) and give them a `seed`.
+Six checks for classes of bug that human security review keeps finding in Payload plugins. They are plain functions a plugin repo runs in its own Vitest suite or CI against a Payload instance. Like the rest of Whitehat they report and never fix, and findings carry a severity. The probes do write: they try to create, change and delete rows in the collections you name, and a probe that gets through leaves its change behind, so run them on a throwaway database with made-up users and records (the in-memory MongoDB the plugin's own tests use is the usual choice) and give them a `seed`.
 
 A probe counts something as refused only when it sees a refusal (`isRefusal`): the marker (see below), or an error whose `status` is exactly the integer 401, 403 or 404 with nothing nested in it. Everything else is `not-checked`: a message, a name such as Forbidden or NotFound at another status, a validation error (400, 422), a database error, a wrong collection slug. A check that cannot judge never reports a pass. Pass your own `isRefusal` where a site refuses some other way.
 
 ```ts
-import { runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, lintDirectory, formatReport } from '@extantape/payload-plugin-whitehat'
+import { runContextLeakCheck, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, lintDirectory, formatReport } from '@extantape/payload-plugin-whitehat'
 ```
 
 Turn findings into a test failure with `expect(findings.filter((f) => f.status !== 'pass')).toEqual([])`, and print `formatReport(findings)` to see them. `not-checked` should fail the suite too: a probe that couldn't run proves nothing.
@@ -75,13 +75,29 @@ For a veto hook, set `kind: 'veto'`. The rule is different: `attempt` is somethi
 
 ## 5. `lintDirectory` and `lintSource`
 
-A heuristic read of source text (never an edit) of every source file, helpers included. It flags a host hook's answer used as a truth value instead of `=== true`, and a paginated `payload.find` passing `req`, without `pagination: false`, as the first query of its function. A find that follows another query in the same function is skipped. Each hit names `file:line`. Limits: it can't see whether a transaction is open or what calls the function, it doesn't follow calls into other functions, and it misses a host hook held under another name. A hit says look here; a clean run isn't proof.
+A heuristic read of source text (never an edit) of every source file, helpers included. It flags a host hook's answer used as a truth value instead of `=== true`, a paginated `payload.find` passing `req`, without `pagination: false`, as the first query of its function, and a local API call that passes both `context` and the shared `req` (`context-on-shared-req`). A `req` made with `isolateObjectProperty(req, ['context'])`, in the call or assigned to `req` earlier in the file, is skipped. A find that follows another query in the same function is skipped. Each hit names `file:line`. Limits: it can't see whether a transaction is open or what calls the function, it doesn't follow calls into other functions, and it misses a host hook held under another name. A hit says look here; a clean run isn't proof.
 
 ```ts
 it('has no known review-finding patterns', () => {
   expect(lintDirectory(new URL('../src', import.meta.url).pathname).filter((f) => f.status === 'fail')).toEqual([])
 })
 ```
+
+## 6. `runContextLeakCheck`
+
+Payload merges the `context` of a local API call into `req.context` whenever the call passes `req`, and the merged keys stay for every later operation on that request. A plugin that writes an internal row with `context: { skipX: true }` and the caller's `req` turns its own hooks off for the rest of the request. That's how a lock or audit hook gets skipped on a bulk update's second document.
+
+The check makes a request with `createLocalReq` (carrying one probe key), copies its `req.context`, runs your `operation(req)`, and compares the keys one level deep. Any key added, changed or removed is a fail (default severity high), listed by name. Values are never printed. Keys the plugin is meant to leave, by contract, go in `ignore`. If the request can't be made, or the operation throws, the result is `not-checked`: an operation that stopped early may not have reached the write that leaks.
+
+```ts
+const [finding] = await runContextLeakCheck({
+  payload,
+  user: editor,
+  operation: (req) => payload.update({ collection: 'notes', where: { id: { exists: true } }, data: { title: 'x' }, req }),
+})
+```
+
+The fix in the plugin is `req: isolateObjectProperty(req, ['context'])` (exported by `payload`) on the internal call. It only sees what one operation leaves behind, so give it the operations that run your hooks: a bulk update, a create, a delete.
 
 ## Running them in a plugin PR
 

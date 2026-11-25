@@ -163,3 +163,8 @@ Gaps: dependency advisories (planned); GraphQL depth and complexity (planned); t
 
 - Gaps skipped: `payloadReadPaths` against a real Payload (it only calls the Local API with the viewer's access; covered when a site runs it in its own tests).
 - Planned checks in `CHECKLIST.md` get tests as they're automated.
+
+## 2026-11-25 (K768)
+
+- Covered: `runContextLeakCheck` fails on a leaky afterChange hook in a 2-note bulk update and names the key (not the probe), passes when the hook isolates `req` or is off, honors `ignore`, reports a removed key, and is not-checked when the operation throws (`test/review.test.ts` section 6). Lint rule `context-on-shared-req`: seven cases, flagged and quiet (`test/lint.test.ts`).
+- Gaps skipped: nested context objects changed in place below the first level (the check compares one level deep, and says so in the docs).

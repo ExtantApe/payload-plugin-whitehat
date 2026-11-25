@@ -1,4 +1,4 @@
-import { APIError, Forbidden, type CollectionConfig, type Config, type Payload, type Plugin } from 'payload'
+import { APIError, Forbidden, isolateObjectProperty, type CollectionConfig, type Config, type Payload, type Plugin } from 'payload'
 
 /** A made-up database fault shaped like the driver's: carries the code, codeName and label, and no HTTP status. */
 const driverFault = () => Object.assign(new Error('transaction aborted'), { name: 'MongoServerError', code: 251, codeName: 'NoSuchTransaction', errorLabels: ['TransientTransactionError'] })
@@ -32,6 +32,8 @@ export const state = {
   host: {} as { allowClosed?: (id: string) => unknown; vetoInvite?: (id: string) => unknown },
   /** How the plugin treats transactions being off: do nothing, refuse at start-up, or refuse writes. */
   transactions: 'ignored' as 'ignored' | 'startup' | 'write',
+  /** After a note changes, log an event with a skip flag in context: not at all, on the shared req, or on an isolated one. */
+  contextLeak: 'off' as 'off' | 'leaky' | 'isolated',
 }
 
 const owner = (user: unknown) => String((user as { id?: unknown } | null)?.id ?? '')
@@ -75,6 +77,12 @@ const notes: CollectionConfig = {
         if (state.silentLock) return (originalDoc as { locked?: boolean } | undefined)?.locked ? { ...data, title: (originalDoc as { title?: string }).title } : data
         if ((originalDoc as { locked?: boolean } | undefined)?.locked) throw new Forbidden(req.t)
         return data
+      },
+    ],
+    afterChange: [
+      async ({ req }) => {
+        if (state.contextLeak === 'off') return
+        await req.payload.create({ collection: 'invite-events', data: { kind: 'note-changed' }, overrideAccess: true, context: { skipNoteLock: true }, req: state.contextLeak === 'leaky' ? req : isolateObjectProperty(req, ['context']) })
       },
     ],
     beforeDelete: [
