@@ -796,6 +796,16 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     }
     await expect(runTransactionCheck({ start: async () => { throw marker() }, write: async () => undefined, refusal: () => true })).resolves.toBeTruthy()
   })
+  it('naming a wrong refusal option never runs its Symbol.toStringTag getter', async () => {
+    let runs = 0
+    const own = Object.defineProperty({}, Symbol.toStringTag, { get: () => { runs++; return 'X' } })
+    const inherited = Object.create(own)
+    const list = Object.defineProperty([], Symbol.toStringTag, { get: () => { runs++; return 'X' } })
+    for (const bad of [own, inherited, list]) {
+      await expect(runTransactionCheck({ start: async () => { throw marker() }, write: async () => undefined, refusal: bad as never })).rejects.toThrow(/config error.*not an (object|array)\./)
+    }
+    expect(runs).toBe(0)
+  })
   it('a real APIError is read by its own keys: Forbidden, NotFound and the auth errors are bare refusals', () => {
     const t = (_k: string) => 'x'
     for (const e of [new Forbidden(), new NotFound(t as never), new AuthenticationError(t as never), new LockedAuth(t as never), new UnverifiedEmail({ t: t as never })]) expect(isRefusal(e), e.name).toBe(true)
