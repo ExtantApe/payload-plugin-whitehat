@@ -750,6 +750,15 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     const bad = Object.defineProperty(Object.assign(new Error('x'), { status: 403 }), 'stack', { get: () => ({}), enumerable: false, configurable: true })
     expect(isRefusal(bad)).toBe(false)
   })
+  it('round 16: a stack getter that adds originalError (own key or through setPrototypeOf) makes the error unknown, marker and bare', () => {
+    const mongo = Object.assign(new Error('x'), { name: 'MongoNetworkError' })
+    const viaOwn = (e: Error) => Object.defineProperty(e, 'stack', { get() { Object.defineProperty(e, 'originalError', { value: mongo, enumerable: true, configurable: true }); return 'text' }, enumerable: false, configurable: true })
+    const viaProto = (e: Error) => Object.defineProperty(e, 'stack', { get() { Object.setPrototypeOf(e, Object.assign(Object.create(Error.prototype), { originalError: mongo })); return 'text' }, enumerable: false, configurable: true })
+    for (const [name, hook] of Object.entries({ own: viaOwn, proto: viaProto })) {
+      expect(isRefusal(hook(new APIError('No', 403, { refusal: 'transactions-required' }))), `marker ${name}`).toBe(false)
+      expect(isRefusal(hook(Object.assign(new Error('No'), { status: 403 }))), `bare ${name}`).toBe(false)
+    }
+  })
   it('a refusal option of the wrong type is a config error, not a quiet not-checked', async () => {
     for (const bad of [/403/, 'forbidden', 42, null, {}]) {
       await expect(runTransactionCheck({ start: async () => { throw marker() }, write: async () => undefined, refusal: bad as never })).rejects.toThrow(/config error.*"refusal"/)

@@ -324,6 +324,13 @@ const plainInheritance = (error: object): boolean => {
 }
 const plainRefusalKeys = (error: object): boolean => {
   if (utilTypes.isProxy(error)) return false
+  // V8 keeps `stack` as an engine accessor, and a hostile getter is host code. Read it first and once, before the
+  // inheritance check and the key list, so nothing it changes (an own key, setPrototypeOf) can be missed.
+  const stackDesc = Object.getOwnPropertyDescriptor(error, 'stack')
+  if (stackDesc && !('value' in stackDesc)) {
+    const st = (error as { stack?: unknown }).stack
+    if (typeof st !== 'string' && st !== undefined) return false
+  }
   if (!plainInheritance(error)) return false
   const keys = Reflect.ownKeys(error)
   const data = ownValue(error, 'data')
@@ -332,12 +339,8 @@ const plainRefusalKeys = (error: object): boolean => {
   // Every own key is a plain data property (no getter) and its value has the right type, so a driver error can't ride inside one.
   for (const k of keys as string[]) {
     const d = Object.getOwnPropertyDescriptor(error, k)
-    // V8 keeps `stack` as an engine accessor; read it once and require text. Every other key must be a plain data property.
-    if (k === 'stack' && d && !('value' in d)) {
-      const st = (error as { stack?: unknown }).stack
-      if (typeof st !== 'string' && st !== undefined) return false
-      continue
-    }
+    // `stack` as an accessor was read and checked above. Every other key must be a plain data property.
+    if (k === 'stack' && d && !('value' in d)) continue
     if (!d || !('value' in d)) return false
     const v = d.value
     if (k === 'message' || k === 'stack' || k === 'name') {
