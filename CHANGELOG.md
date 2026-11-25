@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-25)
 
 - **Config error without a getter (2026-11-24).** The `runTransactionCheck` config error for a non-function `refusal` option named the value with `Object.prototype.toString`, which runs a `Symbol.toStringTag` getter. It now says `an object` or `an array`. Tested: 1 new test (own, inherited and array getters run 0 times), full suite, tsc and the leak check. Not tested: a live site.
 - **Review-finding checks, round 18 (2026-11-24).** Fail-closed fix from Simon's round 17 review (00165). An error with no message got its text from `Object.prototype.toString.call`, which reads `Symbol.toStringTag` by ordinary lookup, so an own or inherited accessor on it ran host code once in each of `isValidationError`, `statusOf` and `isRefusal`. The text is now empty in that case. Nothing judges from that text (only the error-message output reads it, and it already handled empty), so verdicts are unchanged. Tested: 124 tests pass twice (123 before, 1 new: own and inherited `Symbol.toStringTag` getters, plus nested and array forms, never run through `isRefusal`, `isValidationError`, `isDatabaseError` and `isTransactionError`), tsc and the leak check pass; the new test fails on 6a46540. Not tested: the organizations, positions and sharing plugins' own throws; real driver errors on a live server. Not changed: the config-error message in `runTransactionCheck` still calls `Object.prototype.toString` on a non-function `refusal` option, which is the caller's own config and not an error under test.
