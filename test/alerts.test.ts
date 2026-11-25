@@ -1,6 +1,7 @@
 import { mongooseAdapter } from '@payloadcms/db-mongodb'
 import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { buildConfig, getPayload, type Payload } from 'payload'
+import { closeAll } from './helpers/mongo.js'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { fingerprint, recordFindings, retest, runSuite, scanUserContent, whitehat, type Finding, type WhitehatOptions } from '../src/index.js'
@@ -43,8 +44,7 @@ beforeAll(async () => {
 }, 120_000)
 
 afterAll(async () => {
-  await payload?.destroy()
-  await mongo?.stop()
+  expect(await closeAll([payload], mongo)).toEqual([])
 })
 
 describe('alerts', () => {
