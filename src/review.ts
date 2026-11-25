@@ -21,8 +21,8 @@ const intStatus = (v: unknown): number => (typeof v === 'number' && Number.isInt
 /** The HTTP status of an error, or NaN. Never throws: a getter that throws reads as NaN. */
 const statusOf = (e: unknown): number => {
   try {
-    const o = e as { status?: unknown; statusCode?: unknown } | null | undefined
-    return intStatus(o?.status ?? o?.statusCode)
+    const s = snapshot(e)
+    return s.unreadable ? NaN : s.status
   } catch {
     return NaN
   }
@@ -38,7 +38,7 @@ const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult'
 const NESTED_KEYS = ['cause', 'originalError', 'errorResponse', 'errors', 'writeErrors', 'writeConcernError', 'errInfo', 'extensions', 'result', 'err', 'reason', 'response', 'exception', 'details'] as const
 
 /** What the walk reads from one error, taken once and safely: a property that throws marks the snapshot unreadable. */
-type Snap = { name: unknown; code: unknown; codeName: unknown; errmsg: unknown; labels: string[]; status: number; text: string; own: string | null; children: unknown[]; unreadable: boolean; opaque: boolean }
+type Snap = { name: unknown; code: unknown; codeName: unknown; errmsg: unknown; errors: unknown; labels: string[]; status: number; text: string; own: string | null; children: unknown[]; unreadable: boolean; opaque: boolean }
 
 const MAX_CONTAINER = 10_000
 const isPlainObject = (v: object): boolean => {
@@ -141,12 +141,50 @@ function isOpaque(node: object): boolean {
   }
 }
 
-/** Reads each property inside try/catch (a getter can throw), so a hostile error cannot crash a check. A throw means "unreadable". */
+/** Text for a value only when it is a primitive. An object's own toString is host code, so it reads as empty. */
+const prim = (v: unknown): string => (v === null || (typeof v !== 'object' && typeof v !== 'function') ? String(v) : '')
+
+/**
+ * Whether `v` can be turned into JSON text without running host code: primitives, arrays and plain objects (up to a
+ * few levels) whose values are all plain data properties. A getter, a Proxy or a class instance (it may have toJSON)
+ * says no.
+ */
+function plainJson(v: unknown, depth = 0): boolean {
+  if (v === null || typeof v !== 'object') return typeof v !== 'function' && typeof v !== 'symbol'
+  if (depth > 4 || utilTypes.isProxy(v)) return false
+  const proto = Object.getPrototypeOf(v)
+  if (proto !== Object.prototype && proto !== null && !Array.isArray(v)) return false
+  if (Array.isArray(v) && proto !== Array.prototype) return false
+  for (const k of Reflect.ownKeys(v)) {
+    if (typeof k === 'symbol') return false
+    const d = Object.getOwnPropertyDescriptor(v, k)
+    if (!d || !('value' in d)) return false
+    if (!plainJson(d.value, depth + 1)) return false
+  }
+  return Object.prototype.hasOwnProperty.call(v, 'toJSON') ? false : !('toJSON' in v)
+}
+
+/**
+ * Takes everything a check needs from one error, once, from property descriptors only (own and inherited, down the
+ * prototype chain). No getter ever runs here: a property that is an accessor, or sits behind a Proxy, reads as
+ * unknown (`unreadable`), which every caller treats as "not a refusal" or "may be a database error". Nothing is
+ * converted with String() unless it is a primitive. Callers judge from the returned Snap and never touch the live
+ * error again. (The one getter that runs is V8's `stack`, which `readStack` reads before this is called.)
+ */
 function snapshot(node: unknown): Snap {
-  const snap: Snap = { name: undefined, code: undefined, codeName: undefined, errmsg: undefined, labels: [], status: NaN, text: '', own: null, children: [], unreadable: false, opaque: false }
+  const snap: Snap = { name: undefined, code: undefined, codeName: undefined, errmsg: undefined, errors: undefined, labels: [], status: NaN, text: '', own: null, children: [], unreadable: false, opaque: false }
   if (typeof node === 'string') {
     snap.text = node
     snap.own = node
+    return snap
+  }
+  if (node === null || (typeof node !== 'object' && typeof node !== 'function')) {
+    snap.text = prim(node)
+    return snap
+  }
+  if (utilTypes.isProxy(node)) {
+    snap.unreadable = true
+    snap.opaque = true
     return snap
   }
   if (Array.isArray(node) || node instanceof Map || node instanceof Set) {
@@ -158,34 +196,67 @@ function snapshot(node: unknown): Snap {
     return snap
   }
   snap.opaque = isOpaque(node as object)
-  const o = node as Record<string, unknown>
   const get = (k: string): unknown => {
     try {
-      return o[k]
+      let p: object | null = node as object
+      for (let i = 0; p !== null; i++, p = Object.getPrototypeOf(p)) {
+        if (i > 50 || utilTypes.isProxy(p)) break
+        const d = Object.getOwnPropertyDescriptor(p, k)
+        if (d) {
+          if ('value' in d) return d.value
+          break
+        }
+        if (Object.getPrototypeOf(p) === null) return undefined
+      }
     } catch {
-      snap.unreadable = true
-      return undefined
+      // fall through to unknown
     }
+    snap.unreadable = true
+    return undefined
   }
   snap.name = get('name')
   snap.code = get('code')
   snap.codeName = get('codeName')
   snap.errmsg = get('errmsg')
+  snap.errors = get('errors')
   const status = get('status') ?? get('statusCode')
   snap.status = intStatus(status)
   try {
     const l = get('errorLabels')
-    snap.labels = Array.isArray(l) ? l.map(String) : l instanceof Set ? [...l].map(String) : []
+    const items: unknown[] = []
+    if (utilTypes.isSet(l)) {
+      for (const x of Set.prototype.values.call(l)) items.push(x)
+    } else if (Array.isArray(l) && !utilTypes.isProxy(l) && Object.getPrototypeOf(l) === Array.prototype) {
+      const len = Object.getOwnPropertyDescriptor(l, 'length')?.value
+      if (typeof len !== 'number' || len > MAX_CONTAINER) snap.unreadable = true
+      else {
+        for (let i = 0; i < len; i++) {
+          const d = Object.getOwnPropertyDescriptor(l, String(i))
+          if (d && 'value' in d) items.push(d.value)
+          else if (d) snap.unreadable = true
+        }
+      }
+    } else if (l !== undefined && l !== null) snap.unreadable = true
+    // Only primitives are text. An object in the list is not a label, and its toString is not ours to run.
+    for (const x of items) {
+      if (x !== null && typeof x === 'object') snap.unreadable = true
+      else snap.labels.push(prim(x))
+    }
     const message = get('message')
-    snap.text = String(message ?? node)
-    if (typeof message === 'string') snap.own = message
+    if (typeof message === 'string') {
+      snap.own = message
+      snap.text = message
+    } else if (message !== undefined && message !== null) snap.text = prim(message)
+    else snap.text = Object.prototype.toString.call(node)
     const d = get('data')
     if (d !== undefined && d !== null) {
-      try {
-        snap.text += JSON.stringify(d) ?? ''
-      } catch {
-        // an unserializable data object adds nothing to the text
-      }
+      if (plainJson(d)) {
+        try {
+          snap.text += JSON.stringify(d) ?? ''
+        } catch {
+          // an unserializable data object adds nothing to the text
+        }
+      } else snap.unreadable = true
     }
   } catch {
     snap.unreadable = true
@@ -236,13 +307,13 @@ function walk(error: unknown, test: (snap: Snap, depth: number) => boolean): { h
 }
 
 const ownTransactionError = (e: Snap): boolean => {
-  if (TX_CODE_NAMES.includes(String(e.codeName)) || TX_CODE_NAMES.includes(String(e.name))) return true
-  if (typeof e.code === 'number' && TX_CODES.includes(e.code) && (typeof e.codeName === 'string' || typeof e.errmsg === 'string' || /^Mongo/.test(String(e.name)))) return true
+  if (TX_CODE_NAMES.includes(prim(e.codeName)) || TX_CODE_NAMES.includes(prim(e.name))) return true
+  if (typeof e.code === 'number' && TX_CODES.includes(e.code) && (typeof e.codeName === 'string' || typeof e.errmsg === 'string' || /^Mongo/.test(prim(e.name)))) return true
   return e.labels.some((l) => TX_LABELS.includes(l))
 }
 const ownDatabaseError = (e: Snap): boolean =>
   // A server reply (`errmsg` with a numeric `code`) is the database talking, even without a `codeName`.
-  ownTransactionError(e) || /^Mongo/.test(String(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || (typeof e.errmsg === 'string' && typeof e.code === 'number') || e.labels.length > 0
+  ownTransactionError(e) || /^Mongo/.test(prim(e.name)) || (typeof e.codeName === 'string' && e.codeName !== '') || (typeof e.errmsg === 'string' && typeof e.code === 'number') || e.labels.length > 0
 
 /**
  * Whether an error is the database's own transaction trouble: a driver error with a transaction `codeName`
@@ -284,8 +355,8 @@ function guardRefusal(custom: ((error: unknown) => boolean) | undefined): (error
 /** A validation error: status 400 or 422, or the name ValidationError. A typo in a probe's data looks like this, so it says nothing about access. */
 export function isValidationError(error: unknown): boolean {
   try {
-    const e = error as { name?: unknown } | null
-    return [400, 422].includes(statusOf(error)) || String(e?.name) === 'ValidationError'
+    const s = snapshot(error)
+    return [400, 422].includes(s.unreadable ? NaN : s.status) || prim(s.name) === 'ValidationError'
   } catch {
     return false
   }
@@ -322,15 +393,22 @@ const plainInheritance = (error: object): boolean => {
   }
   return true
 }
-const plainRefusalKeys = (error: object): boolean => {
+/**
+ * V8 keeps `stack` as an engine accessor, and a hostile getter is host code. This is the only getter ever run on an
+ * error, and it runs first and once, before the snapshot, the inheritance check and the key list, so nothing it
+ * changes (an own key, setPrototypeOf, an inherited getter) can be missed. False when the stack is not text.
+ */
+const readStack = (error: object): boolean => {
   if (utilTypes.isProxy(error)) return false
-  // V8 keeps `stack` as an engine accessor, and a hostile getter is host code. Read it first and once, before the
-  // inheritance check and the key list, so nothing it changes (an own key, setPrototypeOf) can be missed.
   const stackDesc = Object.getOwnPropertyDescriptor(error, 'stack')
   if (stackDesc && !('value' in stackDesc)) {
     const st = (error as { stack?: unknown }).stack
     if (typeof st !== 'string' && st !== undefined) return false
   }
+  return true
+}
+const plainRefusalKeys = (error: object): boolean => {
+  if (utilTypes.isProxy(error)) return false
   if (!plainInheritance(error)) return false
   const keys = Reflect.ownKeys(error)
   const data = ownValue(error, 'data')
@@ -383,18 +461,17 @@ const claimsRefusal = (data: unknown): boolean => {
  * It is `status` 403 as a plain own number, a `data` that is a plain object (prototype Object.prototype) whose own
  * keys are exactly ['refusal'] with that value, `cause` absent or `data`, no `errors`, and nothing else on the error.
  */
-const hasMarker = (error: unknown): boolean => {
+const hasMarker = (error: object, s: Snap): boolean => {
   try {
-    if (typeof error !== 'object' || error === null || !plainRefusalKeys(error)) return false
+    if (!plainRefusalKeys(error)) return false
     if (ownValue(error, 'status') !== 403) return false
     const data = ownValue(error, 'data')
     if (typeof data !== 'object' || data === null || utilTypes.isProxy(data) || Object.getPrototypeOf(data) !== Object.prototype) return false
     const keys = Reflect.ownKeys(data)
     if (keys.length !== 1 || keys[0] !== 'refusal' || ownValue(data, 'refusal') !== TRANSACTIONS_REQUIRED) return false
-    if ((error as { errors?: unknown }).errors !== undefined || 'errors' in error) return false
+    if (s.errors !== undefined || 'errors' in error) return false
     // A driver or validation error never counts, whatever it carries.
-    const s = snapshot(error)
-    return !s.unreadable && !ownDatabaseError(s) && String(s.name) !== 'ValidationError'
+    return !s.unreadable && !ownDatabaseError(s) && prim(s.name) !== 'ValidationError'
   } catch {
     return false
   }
@@ -406,17 +483,20 @@ const hasMarker = (error: unknown): boolean => {
  * Proxy) and no database-driver fields. Nothing is judged by its message or name: a 'Forbidden' or 'NotFound' at any
  * other status, a plain Error and every text are not refusals, and neither is a validation error. A NotFound (404),
  * AuthenticationError (401), LockedAuth and UnverifiedEmail (403) count as refusals like any other bare 401, 403 or 404.
+ * The error is read once, from property descriptors, into a snapshot (only V8's `stack` getter ever runs); every judgment
+ * is made from that snapshot, and any other getter reads as unknown, which is not a refusal.
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
   try {
-    if (hasMarker(error)) return true
-    if (typeof error !== 'object' || error === null || !plainRefusalKeys(error)) return false
-    // The status is a plain own number here too (a getter can change its answer), and `data` may not claim to be a refusal.
+    if (typeof error !== 'object' || error === null || !readStack(error)) return false
+    const s = snapshot(error)
+    if (hasMarker(error, s)) return true
+    if (!plainRefusalKeys(error)) return false
+    // The status is a plain own number here too, and `data` may not claim to be a refusal.
     const status = ownValue(error, 'status') ?? ownValue(error, 'statusCode')
     if (!REFUSAL_STATUSES.includes(intStatus(status)) || claimsRefusal(ownValue(error, 'data')) || !plainBareData(ownValue(error, 'data'))) return false
     // Anything nested (even a cycle back to itself), anything unreadable, or a driver's own fields means "unknown".
-    const s = snapshot(error)
     return !s.unreadable && s.children.length === 0 && !ownDatabaseError(s)
   } catch {
     return false

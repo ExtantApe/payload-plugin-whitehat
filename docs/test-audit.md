@@ -2,6 +2,22 @@
 
 Newest first.
 
+## 2026-11-24 (round 17): one descriptor-only snapshot
+
+Suite: 121 plus 2 new tests (123, `npx vitest run`). Both fail on 31f1b8f.
+
+- **Covered.** For each of `code`, `codeName`, `errmsg` and `errorLabels`, an inherited getter that sets status 500, swaps `data` or adds `originalError` is never run and the error is unknown, on the marker and the bare path. A label or `codeName` object with its own `toString` is never converted.
+- **Gaps.** Real driver errors on a live server and the three host plugins' own throws belong elsewhere.
+- **Skipped.** The default `guardRefusal` and the host-rule, back-door and difference-probe checks all call `isRefusal`, so they are not tested separately.
+
+## 2026-11-24 (round 16): stack read first
+
+Suite: round 15's 120 plus 1 new test (121). Added late; the round 16 entry was missing.
+
+- **Covered.** A `stack` getter that adds `originalError` (own key or `setPrototypeOf`) makes the marker and the bare error unknown. A `stack` accessor that gives text is accepted, one that gives anything else is not.
+- **Gaps found by review.** Inherited getters on `code`, `codeName`, `errmsg` and `errorLabels` still ran after the checks. Closed in round 17.
+- **Skipped.** Nothing new.
+
 ## 2026-11-24 (round 15): nothing from the prototype chain
 
 Suite: round 14's 116 plus 4 new tests (`npx vitest run`).

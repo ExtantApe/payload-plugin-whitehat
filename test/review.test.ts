@@ -759,6 +759,37 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
       expect(isRefusal(hook(Object.assign(new Error('No'), { status: 403 }))), `bare ${name}`).toBe(false)
     }
   })
+  it('round 17: an inherited getter on code, codeName, errmsg or errorLabels is never run, and the error reads as unknown, marker and bare', () => {
+    const mongo = Object.assign(new Error('x'), { name: 'MongoNetworkError' })
+    const effects: Record<string, (e: Error) => void> = {
+      status500: (e) => Object.defineProperty(e, 'status', { value: 500, enumerable: true, configurable: true, writable: true }),
+      swapData: (e) => Object.defineProperty(e, 'data', { value: { refusal: 'other' }, enumerable: true, configurable: true, writable: true }),
+      originalError: (e) => Object.defineProperty(e, 'originalError', { value: mongo, enumerable: true, configurable: true }),
+    }
+    for (const field of ['code', 'codeName', 'errmsg', 'errorLabels']) {
+      for (const [effect, run] of Object.entries(effects)) {
+        for (const kind of ['marker', 'bare']) {
+          const e = kind === 'marker' ? new APIError('No', 403, { refusal: 'transactions-required' }) : Object.assign(new Error('No'), { status: 403 })
+          let calls = 0
+          const proto = Object.create(Object.getPrototypeOf(e))
+          Object.defineProperty(proto, field, { get() { calls++; run(e); return undefined }, configurable: true })
+          Object.setPrototypeOf(e, proto)
+          expect(isRefusal(e), `${field} ${effect} ${kind}`).toBe(false)
+          expect(calls, `${field} ${effect} ${kind} getter ran`).toBe(0)
+        }
+      }
+    }
+  })
+  it('round 17: no String() on an object: a label or codeName whose toString is host code is never called', () => {
+    let calls = 0
+    const hostile = { toString() { calls++; return 'x' } }
+    const a = Object.assign(new Error('No'), { status: 403, errorLabels: [hostile] })
+    const b = Object.assign(new Error('No'), { status: 403, codeName: hostile })
+    expect(isRefusal(a)).toBe(false)
+    expect(isRefusal(b)).toBe(false)
+    expect(isDatabaseError(a)).toBe(true)
+    expect(calls).toBe(0)
+  })
   it('a refusal option of the wrong type is a config error, not a quiet not-checked', async () => {
     for (const bad of [/403/, 'forbidden', 42, null, {}]) {
       await expect(runTransactionCheck({ start: async () => { throw marker() }, write: async () => undefined, refusal: bad as never })).rejects.toThrow(/config error.*"refusal"/)
