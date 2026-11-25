@@ -1,5 +1,8 @@
 import { APIError, Forbidden, type CollectionConfig, type Config, type Payload, type Plugin } from 'payload'
 
+/** A made-up database fault shaped like the driver's: carries the code, codeName and label, and no HTTP status. */
+const driverFault = () => Object.assign(new Error('transaction aborted'), { name: 'MongoServerError', code: 251, codeName: 'NoSuchTransaction', errorLabels: ['TransientTransactionError'] })
+
 /**
  * A tiny made-up plugin with switches for deliberately broken variants. The switches are read at run time, so
  * one Payload instance can play every variant; tests flip them and put them back. Nothing here is a real plugin.
@@ -61,7 +64,7 @@ const notes: CollectionConfig = {
   hooks: {
     beforeChange: [
       async ({ data, originalDoc, req, operation }) => {
-        if (state.crash) throw new Error('NoSuchTransaction: transaction aborted')
+        if (state.crash) throw driverFault()
         if (state.transactions === 'write' && (await req.transactionID) == null) throw new APIError('This plugin needs database transactions, and they are off.', 403)
         if (state.accessOnly || (state.txHole && !req.transactionID)) return data
         if (operation === 'create') {
@@ -76,7 +79,7 @@ const notes: CollectionConfig = {
     ],
     beforeDelete: [
       async ({ req, id }) => {
-        if (state.crash) throw new Error('NoSuchTransaction: transaction aborted')
+        if (state.crash) throw driverFault()
         if (state.accessOnly || state.bulkHole) return
         if (state.txHole && !req.transactionID) return
         const doc = (await req.payload.findByID({ collection: 'notes', id, depth: 0, overrideAccess: true, disableErrors: true })) as { locked?: boolean } | null
@@ -96,7 +99,7 @@ const invites: CollectionConfig = {
   hooks: {
     beforeValidate: [
       async ({ data, req }) => {
-        if (state.crash) throw new Error('NoSuchTransaction: transaction aborted')
+        if (state.crash) throw driverFault()
         const target = String((data as { target?: unknown } | undefined)?.target ?? '')
         const log = (kind: string) => req.payload.create({ collection: 'invite-events', data: { kind }, overrideAccess: true })
         let vetoed = false

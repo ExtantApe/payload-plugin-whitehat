@@ -4,7 +4,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server'
 import { APIError, BasePayload, buildConfig, type Payload } from 'payload'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 
-import { HOST_ANSWERS, isDatabaseError, isDatabaseErrorMessage, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
+import { HOST_ANSWERS, TRANSACTIONS_REQUIRED, TransactionsRequired, isDatabaseError, isRefusal, isTransactionError, isValidationError, runHostRuleCheck, runResponseDifferenceProbe, runServerBackDoorCheck, runTransactionCheck, type Finding, type HostAnswer, type Viewer } from '../src/index.js'
 import { fixturePlugin, state } from './fixtures/fixturePlugin.js'
 import { closeAll } from './helpers/mongo.js'
 
@@ -139,12 +139,12 @@ describe('1. response-difference probe', () => {
   it('reports not-checked when an answer is an error that isn’t a refusal, even the same crash for both', async () => {
     const boom = async () => { throw Object.assign(new Error('db down'), { status: 500 }) }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: boom }] }))[0]!.status).toBe('not-checked')
-    const plain = async () => { throw new Error('NoSuchTransaction') }
+    const plain = async () => { throw Object.assign(new Error('transaction aborted'), { codeName: 'NoSuchTransaction', errorLabels: ['TransientTransactionError'] }) }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plain }] }))[0]!.status).toBe('not-checked')
     const half = async (who: Viewer) => { if (who.role === 'minor') throw new Error('crash'); throw Object.assign(new Error('No'), { status: 403 }) }
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: half }] }))[0]!.status).toBe('not-checked')
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plain }], isRefusal: () => true }))[0]!.status).toBe('not-checked')
-    const plainRefusal = async () => { throw new Error('Members only') }
+    const plainRefusal = async () => { throw new Error('Members only') } // a caller's own predicate is trusted for text
     expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: plainRefusal }], isRefusal: () => true }))[0]!.status).toBe('pass')
     expect((await runResponseDifferenceProbe({ identities: [minor, minor], operations: ops() }))[0]!.status).toBe('not-checked')
   })
@@ -226,7 +226,8 @@ describe('3. server-code back doors', () => {
   it('stays quiet when the lock is in access and in hooks', async () => {
     const out = await runServerBackDoorCheck(payload, target(true))
     expect(out).toHaveLength(10)
-    expect(bad(out)).toEqual([])
+    // Payload's own bulk entries carry only text, so they are not-checked until the plugin adds a status or the marker.
+    expect(bad(out)).toEqual(['not-checked:notes · bulk-update-server-code', 'not-checked:notes · bulk-delete-server-code'])
   })
   it('fires on bulk update and delete when bulk skips the lock', async () => {
     state.bulkHole = true
@@ -361,7 +362,7 @@ describe('4. host rules that replace defaults', () => {
 })
 
 describe('review round 2', () => {
-  const fakeBulk = (errors: { message: string }[], docs: unknown[] = []) =>
+  const fakeBulk = (errors: { message: string; status?: number }[], docs: unknown[] = []) =>
     ({
       find: async () => ({ docs: [{ id: 'row1' }] }),
       findByID: async () => ({ id: 'row1' }),
@@ -374,7 +375,8 @@ describe('review round 2', () => {
 
   it('A: a TypeError in a bulk errors list is not-checked, and a real refusal there passes', async () => {
     expect(bulkOf(await runServerBackDoorCheck(fakeBulk([{ message: "Cannot read properties of undefined (reading 'id')" }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-    expect(bulkOf(await runServerBackDoorCheck(fakeBulk([{ message: 'You are not allowed to perform this action.' }]), col))).toEqual(['pass', 'pass', 'pass', 'pass'])
+    expect(bulkOf(await runServerBackDoorCheck(fakeBulk([{ message: 'You are not allowed to perform this action.' }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
+    expect(bulkOf(await runServerBackDoorCheck(fakeBulk([{ message: 'No', status: 403 }]), col))).toEqual(['pass', 'pass', 'pass', 'pass'])
   })
   it('B: a veto that refuses only on true fails for a reason string', async () => {
     const calls: string[] = []
@@ -391,11 +393,6 @@ describe('review round 2', () => {
       },
     ])
     expect(out.filter((f) => f.status === 'fail').map((f) => f.path)).toEqual(['v · empty-object', 'v · zero', 'v · empty-string', 'v · throw', 'v · where', 'v · one', 'v · yes-string', 'v · empty-array', 'v · false', 'v · function'])
-  })
-  it('C: the plugin’s own “Use a replica set” advice is a refusal, Mongo’s own message is not', async () => {
-    const run = (said: string) => runTransactionCheck({ start: async () => { throw Object.assign(new Error(said), { status: 403 }) }, write: async () => undefined })
-    expect((await run('This plugin needs transactions. Use a replica set.'))[0]).toMatchObject({ status: 'pass' })
-    expect((await run('Transaction numbers are only allowed on a replica set member or mongos'))[0]).toMatchObject({ status: 'not-checked' })
   })
   it('F: one identity allowed and the other got a 500 is a finding', async () => {
     const [f] = await runResponseDifferenceProbe({
@@ -448,7 +445,7 @@ describe('review round 3', () => {
       const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-shaped', false) }), write: async () => { throw e } })
       expect(f!.status).toBe('not-checked')
       // Even a custom pattern that matches the message can't turn a database error into a refusal.
-      const [g] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-shaped', false) }), write: async () => { throw e }, refusal: /./ })
+      const [g] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-shaped', false) }), write: async () => { throw e }, refusal: () => true })
       expect(g!.status).toBe('not-checked')
     }
   })
@@ -518,7 +515,7 @@ describe('review round 3', () => {
     // The same data on a plugin with no lock at all is a hole.
     state.silentLock = false
     state.txHole = true
-    expect(updates(await runServerBackDoorCheck(payload, col({ title: 'changed' }))).map((f) => f.status)).toEqual(['pass', 'fail'])
+    expect(updates(await runServerBackDoorCheck(payload, col({ title: 'changed' }))).map((f) => f.status)).toEqual(['not-checked', 'fail'])
     await wipe()
   })
   it('4: a delete or create that answers but leaves nothing changed passes', async () => {
@@ -547,588 +544,11 @@ describe('review round 3', () => {
     }) as unknown as Payload
     const col = [{ slug: 'notes', identity: owner, protectedWhere: {}, data: { title: 'x' }, holdsForServerCode: true, seed: async () => undefined }]
     const bulk = (fs: Finding[]) => fs.filter((f) => f.path!.includes('bulk')).map((f) => f.status)
-    expect(bulk(await runServerBackDoorCheck(fake([{ message: 'You are not allowed to perform this action.' }]), col))).toEqual(['pass', 'pass', 'pass', 'pass'])
+    expect(bulk(await runServerBackDoorCheck(fake([{ message: 'You are not allowed to perform this action.' }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
     expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.', status: 403 }]), col))).toEqual(['pass', 'pass', 'pass', 'pass'])
     expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.' }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
     expect(bulk(await runServerBackDoorCheck(fake([{ message: 'The following field is invalid: title', status: 400 }]), col))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
     expect(bulk(await runServerBackDoorCheck(fake([{ message: 'Members only.' }]), col, { isRefusal: (e) => /Members only/.test(String((e as Error).message)) }))).toEqual(['pass', 'pass', 'pass', 'pass'])
-  })
-})
-
-describe('review round 4: a custom isRefusal never turns a database error into a refusal', () => {
-  const everything = () => true
-  const matchesTransaction = (e: unknown) => /transaction|session|interrupted|conflict/i.test(String((e as Error)?.message))
-  /** What the driver says when a session is killed mid-update: plain text, no codeName. */
-  const killed = [
-    'Transaction 12 has been aborted.',
-    'operation was interrupted',
-    'Cannot use session 7 because the session was killed',
-    'Write conflict during plan execution',
-    'NoSuchTransaction: given transaction number 3 does not match',
-    'WriteConflict',
-  ]
-  const col = [{ slug: 'notes', identity: { role: 'owner', user: { id: 'u1' } } as unknown as Viewer, protectedWhere: {}, data: {}, holdsForServerCode: true, seed: async () => undefined }]
-  const denied = () => Promise.reject(Object.assign(new Error('No'), { status: 403 }))
-  /** A made-up payload whose bulk update and delete answer with `errors`, and whose single-document calls throw `single`. */
-  const fake = (errors: { message: string }[], single: () => Promise<unknown> = denied) =>
-    ({
-      find: async () => ({ docs: [{ id: 'row1' }] }),
-      findByID: async () => ({ id: 'row1' }),
-      update: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
-      delete: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
-      create: denied,
-    }) as unknown as Payload
-  const bulk = (fs: Finding[]) => fs.filter((f) => f.path!.includes('bulk')).map((f) => f.status)
-  const single = (fs: Finding[]) => fs.filter((f) => !f.path!.includes('bulk') && !f.path!.includes('create')).map((f) => f.status)
-
-  it('a killed-session bulk update with a custom regex isRefusal is not-checked, never "Refused"', async () => {
-    for (const message of killed) {
-      for (const isRefusalFn of [matchesTransaction, everything, (e: unknown) => /./.test(String((e as Error).message))]) {
-        const out = await runServerBackDoorCheck(fake([{ message }]), col, { isRefusal: isRefusalFn })
-        expect(bulk(out), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-        expect(out.filter((f) => f.status === 'pass' && /Refused/.test(f.how ?? '')).filter((f) => f.path!.includes('bulk'))).toEqual([])
-      }
-    }
-  })
-  it('a killed-session single-document write with a custom isRefusal is not-checked', async () => {
-    for (const message of killed) {
-      const out = await runServerBackDoorCheck(fake([], () => Promise.reject(new Error(message))), col, { isRefusal: everything })
-      expect(single(out), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-    }
-  })
-  it('a driver error with fields is not-checked under a custom isRefusal, with and without a plain message', async () => {
-    const e = Object.assign(new Error('Could not save'), { name: 'MongoServerError', codeName: 'WriteConflict', code: 112, errorLabels: ['TransientTransactionError'] })
-    const out = await runServerBackDoorCheck(fake([], () => Promise.reject(e)), col, { isRefusal: everything })
-    expect(single(out)).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-  })
-  it('ordinary refusal text still passes under a custom isRefusal', async () => {
-    const same = (e: unknown) => /Members only|replica set|not allowed/i.test(String((e as Error).message))
-    const out = await runServerBackDoorCheck(fake([{ message: 'Members only. Use a replica set to join.' }], () => Promise.reject(new Error('Members only.'))), col, { isRefusal: same })
-    expect(bulk(out)).toEqual(['pass', 'pass', 'pass', 'pass'])
-    expect(single(out)).toEqual(['pass', 'pass', 'pass', 'pass'])
-  })
-  it('the standard bulk message does not rescue an entry that also carries a database phrase', async () => {
-    const out = await runServerBackDoorCheck(fake([{ message: 'You are not allowed to perform this action. Transaction 4 has been aborted.' }]), col)
-    expect(bulk(out)).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-  })
-  it('the response-difference probe and the host-rule check also refuse to read a database error as a refusal', async () => {
-    const dbError = () => Object.assign(new Error('Transaction 9 has been aborted.'), { status: 403 })
-    const [d] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: async () => { throw dbError() } }], isRefusal: everything })
-    expect(d!.status).toBe('not-checked')
-    const [h] = await runHostRuleCheck([{ id: 'r', install: () => undefined, attempt: async () => { throw dbError() }, isRefusal: everything }])
-    expect(h!.status).toBe('not-checked')
-  })
-  it('the transactions check ignores a custom pattern for a message-only database error', async () => {
-    const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('no-tx-msg', false) }), write: async () => { throw new Error('Transaction 9 has been aborted.') }, refusal: /transaction/i })
-    expect(f!.status).toBe('not-checked')
-  })
-  it('the message words are tight: ordinary refusal and setup text does not match', () => {
-    for (const m of killed) expect(isDatabaseErrorMessage(m), m).toBe(true)
-    for (const m of ['You are not allowed to perform this action.', 'Use a replica set', 'Transactions are required', 'Members only.', 'Forbidden', 'Your session has expired', 'The user was killed in the game']) expect(isDatabaseErrorMessage(m), m).toBe(false)
-    expect(isRefusal(Object.assign(new Error('Transaction 1 has been aborted.'), { status: 403 }))).toBe(false)
-  })
-})
-
-describe('review round 5: real driver wording, and database messages nested in a cause', () => {
-  const everything = () => true
-  const slash = (e: unknown) => /./.test(String((e as Error).message))
-  /** Plain Errors with only a message, as a wrapper or a bulk entry would carry them. */
-  const real = [
-    'Given transaction number 7 does not match any in-progress transactions. The active transaction number is 8',
-    'Use of expired sessions is not permitted',
-    "Cannot run 'drop' in a multi-document transaction.",
-  ]
-  const col = [{ slug: 'notes', identity: { role: 'owner', user: { id: 'u1' } } as unknown as Viewer, protectedWhere: {}, data: {}, holdsForServerCode: true, seed: async () => undefined }]
-  const denied = () => Promise.reject(Object.assign(new Error('No'), { status: 403 }))
-  const fake = (errors: { message: string }[], single: () => Promise<unknown> = denied) =>
-    ({
-      find: async () => ({ docs: [{ id: 'row1' }] }),
-      findByID: async () => ({ id: 'row1' }),
-      update: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
-      delete: async (a: { where?: unknown }) => (a.where ? { docs: [], errors } : single()),
-      create: denied,
-    }) as unknown as Payload
-  const statuses = (fs: Finding[], pick: (path: string) => boolean) => fs.filter((f) => pick(f.path!)).map((f) => f.status)
-
-  it('real driver message text is a database message, and ordinary refusals still are not', () => {
-    for (const m of real) expect(isDatabaseErrorMessage(m), m).toBe(true)
-    for (const m of ['Members only', 'Use a replica set', 'Your session has expired', 'Transactions are required']) expect(isDatabaseErrorMessage(m), m).toBe(false)
-  })
-  it('a custom isRefusal cannot turn real driver wording into a refusal, in bulk and single-document writes', async () => {
-    for (const message of real) {
-      for (const fn of [everything, slash]) {
-        const bulk = await runServerBackDoorCheck(fake([{ message }]), col, { isRefusal: fn })
-        expect(statuses(bulk, (p) => p.includes('bulk')), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-        const one = await runServerBackDoorCheck(fake([], () => Promise.reject(new Error(message))), col, { isRefusal: fn })
-        expect(statuses(one, (p) => !p.includes('bulk') && !p.includes('create')), message).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-      }
-    }
-  })
-  it('the response-difference probe and the host-rule check reject real driver wording under a custom isRefusal', async () => {
-    for (const message of real) {
-      const [d] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: async () => { throw new Error(message) } }], isRefusal: everything })
-      expect(d!.status, message).toBe('not-checked')
-      const [h] = await runHostRuleCheck([{ id: 'r', install: () => undefined, attempt: async () => { throw new Error(message) }, isRefusal: everything }])
-      expect(h!.status, message).toBe('not-checked')
-    }
-  })
-  it('the transactions check with /./ or a predicate treats real driver wording as not-checked', async () => {
-    for (const message of real) {
-      for (const refusal of [/./, (said: string) => said.length > 0]) {
-        for (const mode of ['off-at-start', 'null-after-start'] as const) {
-          const [f] = await runTransactionCheck({ mode, start: async () => ({ payload: await boot(`r5-${mode}`, mode === 'null-after-start') }), write: async () => { throw new Error(message) }, refusal })
-          expect(f!.status, `${mode} ${message}`).toBe('not-checked')
-        }
-      }
-      const [s] = await runTransactionCheck({ start: async () => { throw new Error(message) }, write: async () => undefined, refusal: /./ })
-      expect(s!.status, message).toBe('not-checked')
-    }
-  })
-  it('a driver message in a nested cause or errorResponse is a database error, under every path', async () => {
-    const nested = [
-      Object.assign(new Error('Could not save'), { cause: new Error(real[1]) }),
-      Object.assign(new Error('Could not save'), { cause: Object.assign(new Error('wrapped'), { cause: new Error(real[0]) }) }),
-      Object.assign(new Error('Could not save'), { errorResponse: { errmsg: real[2] } }),
-      Object.assign(new Error('Could not save'), { status: 403, cause: { message: 'operation was interrupted' } }),
-    ]
-    for (const e of nested) {
-      expect(isRefusal(e)).toBe(false)
-      const out = await runServerBackDoorCheck(fake([], () => Promise.reject(e)), col, { isRefusal: everything })
-      expect(statuses(out, (p) => !p.includes('bulk') && !p.includes('create'))).toEqual(['not-checked', 'not-checked', 'not-checked', 'not-checked'])
-      const [d] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'x', title: 'x', run: async () => { throw e } }], isRefusal: everything })
-      expect(d!.status).toBe('not-checked')
-      const [f] = await runTransactionCheck({ start: async () => ({ payload: await boot('r5-nested', false) }), write: async () => { throw e }, refusal: /./ })
-      expect(f!.status).toBe('not-checked')
-    }
-  })
-  it('a nested ordinary refusal still passes, and a very deep chain does not hang or pass', async () => {
-    const ok = Object.assign(new Error('Members only'), { status: 403, cause: new Error('Use a replica set') })
-    expect(isRefusal(ok)).toBe(true)
-    let deep: Error = new Error(real[1])
-    for (let i = 0; i < 50; i++) deep = Object.assign(new Error('w'), { status: 403, cause: deep })
-    // The chain is longer than the walk goes, so what lies past the limit is unknown, and unknown is not a refusal.
-    expect(isRefusal(deep)).toBe(false)
-  })
-})
-
-describe('review round 6: more driver wording, a stricter default refusal, cycles, errorResponse', () => {
-  const driverText = [
-    'Cannot start transaction 5 on session 1a2b because a newer transaction 6 has already started.',
-    'No transaction started',
-    'Transaction already in progress',
-    'Cannot call commitTransaction after calling abortTransaction',
-    'Cannot call abortTransaction after calling commitTransaction',
-  ]
-  const runDefault = (said: string, mode: 'start' | 'write', make: (m: string) => Error = (m) => new Error(m)) =>
-    runTransactionCheck({
-      start: mode === 'start' ? async () => { throw make(said) } : async () => ({ payload: await boot('r6-default', false) }),
-      write: async () => { throw make(said) },
-    })
-
-  it('real driver wording is a database message', () => {
-    for (const m of driverText) expect(isDatabaseErrorMessage(m), m).toBe(true)
-  })
-  it('code 225 and codeName TransactionTooOld are transaction errors, also in errorResponse', () => {
-    const tooOld = Object.assign(new Error('x'), { name: 'MongoServerError', code: 225, codeName: 'TransactionTooOld' })
-    expect(isTransactionError(tooOld)).toBe(true)
-    expect(isTransactionError(Object.assign(new Error('x'), { errorResponse: { code: 225, codeName: 'TransactionTooOld', errmsg: 'plain' } }))).toBe(true)
-  })
-  it('the default rule no longer accepts driver transaction faults as a clean refusal', async () => {
-    for (const said of [...driverText, 'Transaction failed', 'Transaction 7 could not be completed']) {
-      for (const mode of ['start', 'write'] as const) {
-        const [f] = await runDefault(said, mode)
-        expect(f!.status, `${mode}: ${said}`).toBe('not-checked')
-      }
-    }
-  })
-  it('plugin refusal messages that mention transactions still pass by default', async () => {
-    for (const said of ['This plugin needs database transactions, and they are off.', 'Transactions are required. Use a replica set.', 'Unknown status.', 'You can’t accept this offer.']) {
-      const [f] = await runDefault(said, 'start', (m) => Object.assign(new Error(m), { status: 403 }))
-      // Only messages that mention transactions can be a default refusal here.
-      expect(f!.status, said).toBe(/transaction/i.test(said) ? 'pass' : 'not-checked')
-    }
-    expect(isRefusal(Object.assign(new Error('Unknown status.'), { status: 403 }))).toBe(true)
-    expect(isRefusal(Object.assign(new Error('You can’t accept this offer.'), { status: 403 }))).toBe(true)
-  })
-  it('a self-referential errors array finishes quickly', () => {
-    const e = Object.assign(new Error('loop'), { errors: [] as unknown[] })
-    for (let i = 0; i < 8; i++) e.errors.push(e)
-    const started = Date.now()
-    expect(isDatabaseError(e)).toBe(false)
-    expect(isTransactionError(e)).toBe(false)
-    expect(isRefusal(e)).toBe(false)
-    const a = Object.assign(new Error('a'), { status: 403, errors: [] as unknown[] })
-    const b = Object.assign(new Error('b'), { errors: [a, a, a, a, a, a] })
-    for (let i = 0; i < 8; i++) a.errors.push(a, b)
-    expect(isRefusal(a)).toBe(true)
-    expect(Date.now() - started).toBeLessThan(2000)
-    // A database error hiding behind a cycle is still found.
-    e.errors.push(Object.assign(new Error('y'), { codeName: 'WriteConflict' }))
-    expect(isDatabaseError(e)).toBe(true)
-  })
-  it('errorResponse codeName and errorLabels are read', () => {
-    const named = Object.assign(new Error('Could not save'), { status: 403, errorResponse: { codeName: 'SomeServerThing' } })
-    const labelled = Object.assign(new Error('Could not save'), { status: 403, errorResponse: { errorLabels: ['TransientTransactionError'] } })
-    expect(isDatabaseError(named)).toBe(true)
-    expect(isRefusal(named)).toBe(false)
-    expect(isTransactionError(labelled)).toBe(true)
-    expect(isRefusal(labelled)).toBe(false)
-  })
-})
-
-describe('refusal rule: bare messages, structural driver text, originalError, huge errors lists', () => {
-  const tooOld = `Cannot start transaction 4 on session 8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11 because a newer transaction 5 has already started. ` +
-    `{ lsid: { id: UUID("8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11") }, txnNumber: 4, autocommit: false, startTransaction: true, $clusterTime: { clusterTime: Timestamp(1732380000, 1) } } `.repeat(3)
-  const item2 = ['Cannot call abortTransaction twice', 'Read preference in a transaction must be primary, not: secondary', 'Cannot use timeoutMS inside withTransaction: set it on the client or the session']
-  const driverLong = [tooOld, ...item2, 'MongoClientSession: Cannot use a ClientSession that has ended', 'Transaction 9 has been committed already', 'Transaction exceeded the lifetime limit of 60 seconds', 'The session was killed by an admin', 'x :: caused by :: y']
-  const runDefault = (make: () => Error, mode: 'start' | 'write', refusal?: RegExp) =>
-    runTransactionCheck({
-      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r8-default', false) }),
-      write: async () => { throw make() },
-      refusal,
-    })
-
-  it('the real-length TransactionTooOld text and driver wording are database messages', () => {
-    expect(tooOld.length).toBeGreaterThan(400)
-    for (const m of driverLong) expect(isDatabaseErrorMessage(m), m.slice(0, 60)).toBe(true)
-  })
-  it('a driver message is never a refusal by default or under /transaction|session/, even with a 403', async () => {
-    for (const m of driverLong) {
-      for (const make of [() => new Error(m), () => Object.assign(new Error(m), { status: 403 })]) {
-        for (const refusal of [undefined, /transaction|session/i]) {
-          for (const mode of ['start', 'write'] as const) {
-            const [f] = await runDefault(make, mode, refusal)
-            expect(f!.status, `${mode}: ${m.slice(0, 50)}`).toBe('not-checked')
-          }
-        }
-      }
-      expect(isRefusal(Object.assign(new Error(m), { status: 403 })), m.slice(0, 50)).toBe(false)
-    }
-  })
-  it('codes 117 and 72 are database errors, with or without a codeName, so a loose custom pattern cannot pass them', async () => {
-    const shapes = [
-      Object.assign(new Error('Operation not allowed here, session cannot proceed'), { name: 'MongoServerError', code: 117, codeName: 'ConflictingOperationInProgress' }),
-      Object.assign(new Error('Operation not allowed here, session cannot proceed'), { name: 'MongoServerError', code: 72, codeName: 'InvalidOptions' }),
-      Object.assign(new Error('Operation not allowed here, transaction cannot proceed'), { status: 403, errorResponse: { code: 117, errmsg: 'transaction needs another way' } }),
-      Object.assign(new Error('Operation not allowed here, transaction cannot proceed'), { status: 403, errorResponse: { code: 72, errmsg: 'transaction needs another way' } }),
-    ]
-    for (const e of shapes) {
-      expect(isDatabaseError(e)).toBe(true)
-      expect(isRefusal(e)).toBe(false)
-      const [f] = await runDefault(() => e, 'start', /transaction|session/i)
-      expect(f!.status).toBe('not-checked')
-    }
-  })
-  it('a bare message is not a refusal by default; a 403, an APIError or the caller’s own pattern make it one', async () => {
-    const said = 'This plugin has transactions off, so it cannot run.'
-    expect((await runDefault(() => new Error(said), 'start'))[0]!.status).toBe('not-checked')
-    expect((await runDefault(() => Object.assign(new Error(said), { status: 403 }), 'start'))[0]!.status).toBe('pass')
-    expect((await runDefault(() => new APIError(said, 500), 'start'))[0]!.status).toBe('not-checked')
-    expect((await runDefault(() => new APIError(said, 403), 'write'))[0]!.status).toBe('pass')
-    expect((await runDefault(() => new Error(said), 'start', /transactions off/))[0]!.status).toBe('pass')
-    // A refusal status alone is not enough: the text still has to say no about transactions.
-    expect((await runDefault(() => Object.assign(new Error('Transaction failed'), { status: 403 }), 'start'))[0]!.status).toBe('not-checked')
-  })
-  it('originalError is walked', () => {
-    const wrapped = Object.assign(new Error('Something went wrong'), { originalError: Object.assign(new Error('x'), { codeName: 'WriteConflict' }) })
-    expect(isDatabaseError(wrapped)).toBe(true)
-    expect(isTransactionError(wrapped)).toBe(true)
-    expect(isRefusal(Object.assign(wrapped, { status: 403 }))).toBe(false)
-    const msg = Object.assign(new Error('Unexpected error.'), { status: 403, originalError: new Error(item2[0]) })
-    expect(isRefusal(msg)).toBe(false)
-  })
-  it('an errors array of 250,000 entries does not overflow, and a database entry at the end is found', () => {
-    const errors: unknown[] = []
-    for (let i = 0; i < 250_000; i++) errors.push(new Error(`row ${i} failed`))
-    const plain = Object.assign(new Error('Many failures'), { status: 403, errors })
-    // Past the size cap the list cannot all be read, and nothing in it says no: unknown is never a refusal.
-    expect(isRefusal(plain)).toBe(false)
-    errors.push(Object.assign(new Error('x'), { codeName: 'WriteConflict' }))
-    expect(isDatabaseError(plain)).toBe(true)
-    expect(isRefusal(plain)).toBe(false)
-  })
-  it('ordinary plugin refusals stay refusals', async () => {
-    for (const said of ['This plugin needs database transactions, and they are off.', 'Transactions are required. Use a replica set.', 'This plugin has transactions off.']) {
-      expect((await runDefault(() => Object.assign(new Error(said), { status: 403 }), 'start'))[0]!.status, said).toBe('pass')
-    }
-  })
-})
-
-describe('round 9: walk limits, APIError status, driver text, more fields, throwing getters', () => {
-  const chain = (hidden: unknown, links: number): Error => {
-    let e: Error = Object.assign(new Error('inner'), { cause: hidden })
-    for (let i = 1; i < links; i++) e = Object.assign(new Error('w'), { cause: e })
-    return e
-  }
-  const run = (make: () => unknown, mode: 'start' | 'write' = 'start', refusal?: RegExp) =>
-    runTransactionCheck({
-      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r9', false) }),
-      write: async () => { throw make() },
-      refusal,
-    })
-  const refusalText = 'This plugin needs transactions, and they are off.'
-  const driver = () => Object.assign(new Error('x'), { name: 'MongoServerError', codeName: 'WriteConflict' })
-
-  it('1: a driver error just past the walk limit under a 403 is not-checked, and a cycle still ends', async () => {
-    for (const links of [7, 8, 9, 30]) {
-      const e = Object.assign(chain(driver(), links), { status: 403, message: refusalText })
-      expect(isDatabaseError(e), `links ${links}`).toBe(true)
-      expect(isRefusal(e)).toBe(false)
-      expect((await run(() => e))[0]!.status, `links ${links}`).toBe('not-checked')
-      expect((await run(() => e, 'write'))[0]!.status).toBe('not-checked')
-    }
-    // Within the limit it is found as before.
-    expect((await run(() => Object.assign(chain(driver(), 3), { status: 403, message: refusalText })))[0]!.status).toBe('not-checked')
-    // A cycle is a finished walk, so a plain refusal in a cycle still passes.
-    const a = Object.assign(new Error(refusalText), { status: 403 }) as Error & { cause?: unknown }
-    a.cause = Object.assign(new Error(refusalText), { cause: a })
-    expect((await run(() => a))[0]!.status).toBe('pass')
-  })
-  it('2: an APIError is a refusal only with a 4xx status', async () => {
-    for (const status of [500, undefined, 200, 503]) {
-      const e = new APIError(refusalText, status as number)
-      if (status === undefined) delete (e as { status?: number }).status
-      expect((await run(() => e))[0]!.status, String(status)).toBe('not-checked')
-    }
-    for (const status of [401, 403, 404]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('pass')
-    // 400 is a validation error whatever the class.
-    expect((await run(() => new APIError(refusalText, 400)))[0]!.status).toBe('not-checked')
-  })
-  it('3: more live driver wording is a database message, also under a broad pattern, while plugin refusals still pass', async () => {
-    const texts = [
-      'Cannot call abortTransaction twice',
-      'Read preference in a transaction must be primary, not: secondaryPreferred',
-      'Transaction 12 has been committed.',
-      'Transaction 12 has been aborted.',
-      'Given transaction number 4 does not match any in-progress transactions. The active transaction number is 5',
-      'Cannot continue txnId 7 on this connection',
-      'Operation exceeded time limit',
-      'Session 8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11 was ended',
-      'Session 8f3a1c52-7d2e-4b6a-9c10-5e2d7a9b0c11 has expired',
-      'Cannot use a session that has ended',
-      'Use of expired sessions is not permitted',
-    ]
-    for (const t of texts) {
-      expect(isDatabaseErrorMessage(t), t).toBe(true)
-      for (const refusal of [undefined, /transaction|session|time limit|txn/i]) expect((await run(() => Object.assign(new Error(t), { status: 403 }), 'start', refusal))[0]!.status, t).toBe('not-checked')
-    }
-    expect(isDatabaseErrorMessage('Your session has expired. Sign in again.')).toBe(false)
-    for (const ok of ['This plugin has transactions off.', 'Transactions are required. Use a replica set.']) {
-      expect((await run(() => Object.assign(new Error(ok), { status: 403 })))[0]!.status, ok).toBe('pass')
-    }
-  })
-  it('4: a driver error hidden in writeErrors, writeConcernError, errInfo, errorResponse, extensions or result is found', async () => {
-    const hiddenIn = (key: string, value: unknown) => Object.assign(new Error(refusalText), { status: 403, [key]: value })
-    const cases: Record<string, unknown> = {
-      writeErrors: [{ code: 112, errmsg: 'plain text' }],
-      writeConcernError: driver(),
-      errInfo: { codeName: 'WriteConflict' },
-      errorResponse: { code: 251, errmsg: 'x' },
-      extensions: { originalError: driver() },
-      result: { errors: [driver()] },
-      err: { code: 112, errmsg: 'plain text' },
-    }
-    for (const [key, value] of Object.entries(cases)) {
-      const e = hiddenIn(key, value)
-      expect(isDatabaseError(e), key).toBe(true)
-      expect(isRefusal(e), key).toBe(false)
-      expect((await run(() => e))[0]!.status, key).toBe('not-checked')
-    }
-    const text = hiddenIn('writeErrors', [{ errmsg: 'Cannot call abortTransaction twice' }])
-    expect(isRefusal(text)).toBe(false)
-  })
-  it('5: a throwing property makes the result not-checked, never a crash or a pass', async () => {
-    const boom = () => { throw new Error('getter exploded') }
-    const msg = Object.defineProperty(new Error('x'), 'message', { get: boom })
-    Object.assign(msg, { status: 403 })
-    const status = Object.defineProperty(new Error(refusalText), 'status', { get: boom })
-    const cause = Object.defineProperty(Object.assign(new Error(refusalText), { status: 403 }), 'cause', { get: boom })
-    const nested = Object.assign(new Error(refusalText), { status: 403, cause: Object.defineProperty(new Error('y'), 'code', { get: boom }) })
-    const proxy = new Proxy({}, { get: boom, has: boom, ownKeys: boom })
-    for (const e of [msg, status, cause, nested, proxy]) {
-      expect(isRefusal(e)).toBe(false)
-      expect(isDatabaseError(e)).toBe(true)
-      for (const mode of ['start', 'write'] as const) expect((await run(() => e, mode, /./))[0]!.status).toBe('not-checked')
-      expect((await run(() => e))[0]!.status).toBe('not-checked')
-    }
-    const [r] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'g', title: 'g', run: async () => { throw msg } }] })
-    expect(r!.status).toBe('not-checked')
-  })
-})
-
-describe('round 10: driver text under a refusal, containers, APIError band, hostile status', () => {
-  const refusalText = 'This plugin needs transactions, and they are off.'
-  const run = (make: () => unknown, mode: 'start' | 'write' = 'start', refusal?: RegExp) =>
-    runTransactionCheck({
-      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r10', false) }),
-      write: async () => { throw make() },
-      refusal,
-    })
-  const driver = () => Object.assign(new Error('x'), { name: 'MongoServerError', codeName: 'WriteConflict' })
-  const wrap = (extra: Record<string, unknown>, status = 403) => Object.assign(new Error(refusalText), { status }, extra)
-
-  it('1: any nested message that is not refusal-shaped makes a refusal wrapper not-checked', async () => {
-    const texts = [
-      'connection pool for host-a was cleared', 'MongoNetworkError: socket closed', 'not primary', 'Transaction failed', 'server selection timed out after 30000 ms',
-      'E11000 duplicate key error collection', 'The operation was aborted by the server', 'Unable to roll back the changes', 'Topology was destroyed',
-      'cursor id 4 not found', 'Executor error during find command', 'Lock acquisition failed',
-    ]
-    for (const t of texts) {
-      for (const key of ['cause', 'originalError', 'reason']) {
-        expect((await run(() => wrap({ [key]: new Error(t) })))[0]!.status, `${key}: ${t}`).toBe('not-checked')
-        expect((await run(() => new APIError(refusalText, 403, { [key]: new Error(t) })))[0]!.status, `api ${key}: ${t}`).toBe('not-checked')
-      }
-      expect((await run(() => wrap({ errors: [{ message: t }] }), 'write'))[0]!.status, t).toBe('not-checked')
-    }
-    // A nested message that is itself a refusal keeps the pass.
-    expect((await run(() => wrap({ cause: new Error('This plugin requires transactions.') })))[0]!.status).toBe('pass')
-  })
-  it('2: containers are walked: Map, Set, keyed object, array-like, nested array, reason, response, extensions.exception, errInfo.details', async () => {
-    const d = driver()
-    const holders: Record<string, Record<string, unknown>> = {
-      map: { errors: new Map([['a', d]]) },
-      mapKey: { errors: new Map([[d, 'x']]) },
-      set: { errors: new Set([d]) },
-      keyed: { errors: { first: d } },
-      arrayLike: { errors: { length: 1, 0: d } },
-      nested: { errors: [[[d]]] },
-      nestedMap: { errors: [new Map([['a', [d]]])] },
-      reason: { reason: d },
-      response: { response: { errors: [d] } },
-      exception: { extensions: { exception: d } },
-      details: { errInfo: { details: d } },
-    }
-    for (const [name, h] of Object.entries(holders)) {
-      const e = wrap(h)
-      expect(isDatabaseError(e), name).toBe(true)
-      expect(isTransactionError(e), name).toBe(true)
-      expect(isRefusal(e), name).toBe(false)
-      expect((await run(() => e))[0]!.status, name).toBe('not-checked')
-      expect((await run(() => e, 'write', /./))[0]!.status, name).toBe('not-checked')
-    }
-    // Driver text in a container is found by message too.
-    for (const errors of [new Map([['a', 'Cannot call abortTransaction twice']]), new Set([{ message: 'write conflict' }]), { k: { message: 'No transaction started' } }]) expect(isRefusal(wrap({ errors })), String(errors)).toBe(false)
-    // A cycle through a Map still ends.
-    const m = new Map<string, unknown>()
-    const e = wrap({ errors: m })
-    m.set('self', e)
-    expect(isRefusal(e)).toBe(true)
-  })
-  it('3: an APIError is a refusal only with an integer 401, 403 or 404', async () => {
-    for (const status of [408, 409, 429, 499, 403.5, 402, 410, 451]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('not-checked')
-    for (const status of [401, 403, 404]) expect((await run(() => new APIError(refusalText, status)))[0]!.status, String(status)).toBe('pass')
-    expect((await run(() => Object.assign(new Error(refusalText), { status: 403.5 })))[0]!.status).toBe('not-checked')
-  })
-  it('4: a throwing status getter, and reads of each property once, never crash the difference probe', async () => {
-    const boom = () => { throw new Error('getter exploded') }
-    const e = Object.defineProperty(new Error('nope'), 'status', { get: boom })
-    const [r] = await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'g', title: 'g', run: async (who) => { if (who === minor) throw e; return 1 } }] })
-    expect(r!.status).not.toBe('pass')
-    // role, user id, id and title are read once each.
-    const reads: Record<string, number> = {}
-    const counted = <T extends object>(name: string, o: T, keys: string[]): T => {
-      for (const k of keys) {
-        const v = (o as Record<string, unknown>)[k]
-        Object.defineProperty(o, k, { get: () => { reads[`${name}.${k}`] = (reads[`${name}.${k}`] ?? 0) + 1; return v } })
-      }
-      return o
-    }
-    const user = counted('user', { id: 'u1' }, ['id'])
-    const a = counted('a', { role: 'x', user } as Viewer, ['role', 'user'])
-    const b = counted('b', { role: 'y', user: { id: 'u2' } } as Viewer, ['role'])
-    const op = counted('op', { id: 'p', title: 't', run: async () => 1 } as { id: string; title: string; run: () => Promise<number> }, ['id', 'title'])
-    await runResponseDifferenceProbe({ identities: [a, b], operations: [op] })
-    for (const [k, n] of Object.entries(reads)) expect(n, k).toBe(1)
-    // A viewer whose role throws is not-checked.
-    const hostile = Object.defineProperty({ user: null }, 'role', { get: boom }) as unknown as Viewer
-    expect((await runResponseDifferenceProbe({ identities: [hostile, closed], operations: [{ id: 'g', title: 'g', run: async () => 1 }] }))[0]!.status).toBe('not-checked')
-  })
-})
-
-describe('round 11: whole messages, isRefusal nesting, unreadable nested errors, cycles, integer status', () => {
-  const refusalText = 'This plugin needs transactions, and they are off.'
-  const run = (make: () => unknown, mode: 'start' | 'write' = 'start') =>
-    runTransactionCheck({
-      start: mode === 'start' ? async () => { throw make() } : async () => ({ payload: await boot('r11', false) }),
-      write: async () => { throw make() },
-    })
-  const wrap = (extra: Record<string, unknown>, status = 403) => Object.assign(new Error(refusalText), { status }, extra)
-  const driverTexts = [
-    'writeConcern is not allowed within a multi-statement transaction', 'Cannot write to system collection config.foo within a transaction.',
-    'E11000 duplicate key error collection: app.users index: email_1 dup key: { email: "a@b.c" }', 'connection 3 to host-a:27017 closed', 'Unable to acquire server session',
-    'connection pool for host-a was cleared', 'MongoNetworkError: socket closed', 'not primary', 'Transaction failed', 'server selection timed out after 30000 ms',
-    'The operation was aborted by the server', 'Unable to roll back the changes', 'Topology was destroyed', 'cursor id 4 not found', 'Executor error during find command',
-    'Lock acquisition failed', 'Session expired', 'Your session has expired',
-  ]
-
-  it('1: driver text nested under a refusal, or after one in the same message, is never a pass', async () => {
-    for (const t of driverTexts) {
-      expect((await run(() => wrap({ cause: new Error(t) })))[0]!.status, `nested ${t}`).toBe('not-checked')
-      expect((await run(() => wrap({ errors: [{ message: t }] }), 'write'))[0]!.status, `bulk ${t}`).toBe('not-checked')
-      for (const head of ['This change needs a transaction, so it wasn\'t made. ', 'This plugin needs transactions: ', 'Forbidden - needs a transaction; ']) {
-        const e = Object.assign(new Error(head + t), { status: 403 })
-        expect((await run(() => e))[0]!.status, `top ${head}${t}`).toBe('not-checked')
-        expect((await run(() => e, 'write'))[0]!.status, `top write ${head}${t}`).toBe('not-checked')
-      }
-    }
-    // The plain refusal, and one with advice after it, still pass.
-    expect((await run(() => wrap({})))[0]!.status).toBe('pass')
-    expect((await run(() => Object.assign(new Error('This plugin needs transactions. Use a replica set.'), { status: 403 })))[0]!.status).toBe('pass')
-  })
-
-  it('2: isRefusal rejects a 403 that wraps a database error, in the back-door and host-rule checks too', async () => {
-    for (const t of ['E11000 duplicate key error collection: app.users', 'connection 3 to host-a:27017 closed', 'Unable to acquire server session']) {
-      for (const e of [Object.assign(new Error('Forbidden'), { status: 403, cause: new Error(t) }), Object.assign(new Error('Forbidden'), { status: 403, errors: [{ message: t }] })]) {
-        expect(isRefusal(e), t).toBe(false)
-        expect(isDatabaseError(e) || isDatabaseErrorMessage(t), t).toBe(true)
-      }
-      const crash = Object.assign(new Error('Forbidden'), { status: 403, cause: new Error(t) })
-      const [r] = await runResponseDifferenceProbe({ identities: [{ role: 'a' } as Viewer, { role: 'b' } as Viewer], operations: [{ id: 'z', title: 'z', run: async () => { throw crash } }] })
-      expect(r!.status, t).toBe('not-checked')
-    }
-    expect(isRefusal(Object.assign(new Error('Forbidden'), { status: 403, cause: new Error('You are not allowed to perform this action.') }))).toBe(true)
-  })
-
-  it('3: a nested error that cannot be read means not-checked', async () => {
-    const vm = await import('node:vm')
-    class Plain { message = refusalText }
-    const sym = { [Symbol('hidden')]: new Error('x'), message: refusalText }
-    const hidden = Object.defineProperty({ message: refusalText }, 'inner', { value: new Error('x'), enumerable: false })
-    const stackOnly = Object.defineProperty(new Error(''), 'stack', { value: 'MongoServerError: E11000' })
-    const things: Record<string, unknown> = {
-      objectMessage: { message: { text: 'x' } }, emptyMessage: new Error(''), codeOnly: { code: 999 }, stackOnly, symbolKey: sym, nonEnumerable: hidden,
-      classInstance: new Plain(), crossRealm: vm.runInNewContext('new Error("This plugin needs transactions, and they are off.")'), proxy: new Proxy(new Error(refusalText), {}),
-      graphqlForbidden: { extensions: { code: 'FORBIDDEN' } }, sessionExpired: new Error('Your session expired.'),
-    }
-    for (const [name, nested] of Object.entries(things)) {
-      for (const key of ['cause', 'errors']) {
-        const e = wrap({ [key]: key === 'errors' ? [nested] : nested })
-        expect((await run(() => e))[0]!.status, `${name} ${key}`).toBe('not-checked')
-        // A nested "session expired" is the plugin's own words for isRefusal; only the transaction check treats it as unknown.
-        if (name !== 'sessionExpired') expect(isRefusal(e), `${name} ${key} isRefusal`).toBe(false)
-      }
-    }
-  })
-
-  it('4: a self-referential array of width 30 finishes fast, and a huge array is not read to the end', () => {
-    const arr: unknown[] = []
-    for (let i = 0; i < 30; i++) arr.push(arr)
-    const e = Object.assign(new Error('Forbidden'), { status: 403, errors: arr })
-    const started = Date.now()
-    isRefusal(e)
-    isDatabaseError(e)
-    expect(Date.now() - started).toBeLessThan(1000)
-    const big = Object.assign(new Error('Forbidden'), { status: 403, errors: new Array(50_000).fill(new Error('Forbidden')) })
-    expect(isRefusal(big)).toBe(false)
-  })
-
-  it('5: a status counts only as a real integer number', async () => {
-    for (const status of ['403', 403n, [403], { valueOf: () => 403 }, 403.5, Number.NaN, true]) {
-      const e = Object.assign(new Error(refusalText), { status })
-      expect(isRefusal(e), String(status)).toBe(false)
-      expect((await run(() => e))[0]!.status, String(status)).toBe('not-checked')
-    }
-    expect(isRefusal(Object.assign(new Error('x'), { statusCode: 403 }))).toBe(true)
   })
 })
 
@@ -1139,5 +559,113 @@ describe('interface strings', () => {
     const labels = [...src.matchAll(/<button\b[^>]*>([\s\S]*?)<\/button>/g)].flatMap((m) => [...m[1]!.matchAll(/'([^']*)'|`([^`]*)`/g)].map((s) => s[1] ?? s[2]!))
     expect(labels.length).toBeGreaterThan(0)
     for (const l of labels) expect(/\.\s*$/.test(l.replace(/\$\{[^}]*\}/g, 'x')) && !/…\s*$/.test(l), l).toBe(false)
+  })
+})
+
+describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothing else', () => {
+  // Fixture texts in the spirit of the round 8 to 11 probes: generic public driver wording, made up, never read by the rule.
+  const REFUSAL = 'This change needs a transaction, so it wasn’t made.'
+  const DRIVER_TEXTS = [
+    'Cannot call abortTransaction twice',
+    'No transaction started',
+    'Transaction already in progress',
+    'Transaction numbers are only allowed on storage engines that support document-level locking',
+    'Cannot create namespace test.notes in multi-document transaction.',
+    'writeConcern is not allowed within a multi-statement transaction',
+    'The transaction cannot be committed: the primary stepped down',
+    'E11000 duplicate key error collection: test.notes index: _id_ dup key: { _id: 1 }',
+    'connection 3 to 127.0.0.1:27017 closed',
+    'Server selection timed out after 30000 ms',
+    'not primary',
+    'Use of expired sessions is not permitted',
+    REFUSAL,
+    'This plugin needs transactions. Use a replica set.',
+    'You are not allowed to perform this action.',
+    `${REFUSAL} E11000 duplicate key error`,
+  ]
+
+  it('the exported marker is a refusal, with a fixed data.refusal', () => {
+    const e = new TransactionsRequired()
+    expect(e).toBeInstanceOf(Error)
+    expect(e.data).toEqual({ refusal: 'transactions-required' })
+    expect(isRefusal(e)).toBe(true)
+    expect(isRefusal(new TransactionsRequired('Anything else the plugin wants to say.'))).toBe(true)
+    // A copy from another build of the package still counts, since the value is what is trusted.
+    expect(isRefusal(Object.assign(new Error('x'), { data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(true)
+    expect(isRefusal(Object.assign(new Error('x'), { data: { refusal: 'something-else' } }))).toBe(false)
+  })
+  it('a bare 401, 403 or 404 is a refusal, by status or statusCode', () => {
+    for (const status of [401, 403, 404]) {
+      expect(isRefusal(Object.assign(new Error('x'), { status })), String(status)).toBe(true)
+      expect(isRefusal(Object.assign(new Error('x'), { statusCode: status }))).toBe(true)
+    }
+  })
+  it('any text message is not a refusal, with no status or with 403, as long as it is not bare', () => {
+    for (const t of DRIVER_TEXTS) {
+      expect(isRefusal(new Error(t)), t).toBe(false)
+      expect(isRefusal(t), t).toBe(false)
+      expect(isRefusal({ message: t }), t).toBe(false)
+      expect(isRefusal(Object.assign(new Error(REFUSAL), { status: 403, cause: new Error(t) })), t).toBe(false)
+      expect(isRefusal(Object.assign(new Error(REFUSAL), { status: 403, cause: t })), t).toBe(false)
+      expect(isRefusal(Object.assign(new Error(REFUSAL), { name: 'APIError', status: 403, errors: [{ message: t }] })), t).toBe(false)
+    }
+  })
+  it('names like Forbidden, UnauthorizedError and NotFound at other statuses are not refusals', () => {
+    for (const name of ['Forbidden', 'UnauthorizedError', 'NotFound', 'APIError']) {
+      expect(isRefusal(Object.assign(new Error('No'), { name })), name).toBe(false)
+      for (const status of [400, 402, 405, 408, 409, 422, 429, 499, 500, 503]) expect(isRefusal(Object.assign(new Error('No'), { name, status })), `${name} ${status}`).toBe(false)
+    }
+  })
+  it('only an exact integer 401, 403 or 404 counts', () => {
+    for (const status of ['403', 403n, [403], 403.5, NaN, null, undefined, { valueOf: () => 403 }, true, 4030]) expect(isRefusal(Object.assign(new Error('No'), { status })), String(status)).toBe(false)
+    expect(isRefusal(Object.assign(new Error('No'), { status: '403', statusCode: 403 }))).toBe(false)
+  })
+  it('a 401, 403 or 404 that nests anything is not a refusal', () => {
+    for (const nest of [{ cause: new Error('x') }, { cause: 'x' }, { errors: [{ message: 'x' }] }, { originalError: new Error('x') }, { errorResponse: { message: 'x' } }, { writeErrors: [{}] }, { cause: {} }]) {
+      expect(isRefusal(Object.assign(new Error('No'), { status: 403, ...nest })), JSON.stringify(Object.keys(nest))).toBe(false)
+    }
+  })
+  it('a driver error is never a refusal, whatever status it carries', () => {
+    expect(isRefusal(Object.assign(new Error('x'), { status: 403, codeName: 'NoSuchTransaction', errorLabels: ['TransientTransactionError'] }))).toBe(false)
+    expect(isRefusal(Object.assign(new Error('x'), { status: 404, name: 'MongoServerError', code: 11000 }))).toBe(false)
+  })
+  it('a validation error, a 5xx, a plain error and non-errors are not refusals', () => {
+    for (const e of [Object.assign(new Error('x'), { status: 400 }), Object.assign(new Error('x'), { status: 422 }), Object.assign(new Error('x'), { name: 'ValidationError' }), Object.assign(new Error('x'), { status: 500 }), new Error('Forbidden'), null, undefined, 403, '403', {}]) {
+      expect(isRefusal(e)).toBe(false)
+    }
+  })
+  it('an error whose properties throw is not a refusal and does not crash the rule', () => {
+    const hostile = (key: string) => Object.defineProperty(Object.assign(new Error('x'), { status: 403 }), key, { get: () => { throw new Error('getter') } })
+    for (const key of ['cause', 'errors', 'name', 'code', 'codeName']) expect(isRefusal(hostile(key)), key).toBe(false)
+    expect(isRefusal(Object.defineProperty(new Error('x'), 'status', { get: () => { throw new Error('getter') } }))).toBe(false)
+    expect(isRefusal(Object.defineProperty(new Error('x'), 'data', { get: () => { throw new Error('getter') } }))).toBe(false)
+    const loop: { status: number; cause?: unknown } = { status: 403 }
+    loop.cause = loop
+    expect(isRefusal(loop)).toBe(false)
+  })
+  it('the transactions check passes on the marker and on a bare 403, and is not-checked on any text', async () => {
+    const at = (thrown: unknown) => runTransactionCheck({ start: async () => { throw thrown }, write: async () => undefined })
+    expect((await at(new TransactionsRequired()))[0]).toMatchObject({ status: 'pass', path: 'start-up' })
+    expect((await at(Object.assign(new Error('x'), { status: 403 })))[0]).toMatchObject({ status: 'pass' })
+    for (const t of DRIVER_TEXTS) {
+      expect((await at(new Error(t)))[0]!.status, t).toBe('not-checked')
+      expect((await at(Object.assign(new Error(REFUSAL), { status: 500, cause: new Error(t) })))[0]!.status, t).toBe('not-checked')
+    }
+    // A custom predicate is the caller's own rule, but still never rescues a driver error.
+    const own = { refusal: () => true }
+    expect((await runTransactionCheck({ start: async () => { throw new Error('anything') }, write: async () => undefined, ...own }))[0]!.status).toBe('pass')
+    expect((await runTransactionCheck({ start: async () => { throw Object.assign(new Error('x'), { codeName: 'NoSuchTransaction' }) }, write: async () => undefined, ...own }))[0]!.status).toBe('not-checked')
+  })
+  it('a probe that throws the marker is a refusal in the difference probe and in the host rule check', async () => {
+    const refused = async () => { throw new TransactionsRequired() }
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 'm', title: 'm', run: refused }] }))[0]!.status).toBe('pass')
+    const texty = async () => { throw new Error(REFUSAL) }
+    expect((await runResponseDifferenceProbe({ identities: [minor, closed], operations: [{ id: 't', title: 't', run: texty }] }))[0]!.status).toBe('not-checked')
+  })
+  it('the removed text rules are gone from the package', async () => {
+    const { readFileSync } = await import('node:fs')
+    const src = readFileSync(new URL('../src/review.ts', import.meta.url), 'utf8')
+    for (const gone of ['REFUSAL_CUE', 'REFUSAL_ADVICE', 'everySentenceRefuses', 'DATABASE_MESSAGE', 'isDatabaseErrorMessage', 'databaseMessageIn', 'REFUSAL_NAMES']) expect(src.includes(gone), gone).toBe(false)
+    expect(await import('../src/index.js')).not.toHaveProperty('isDatabaseErrorMessage')
   })
 })

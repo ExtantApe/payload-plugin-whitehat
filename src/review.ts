@@ -30,7 +30,6 @@ const statusOf = (e: unknown): number => {
 
 /** Statuses and error names that mean "the system said no": sign-in, forbidden and not found. Validation is not one. */
 const REFUSAL_STATUSES = [401, 403, 404]
-const REFUSAL_NAMES = ['Forbidden', 'UnauthorizedError', 'NotFound']
 const TX_CODE_NAMES = ['NoSuchTransaction', 'WriteConflict', 'TransactionTooOld', 'TransactionAborted', 'TransactionCommitted', 'OperationNotSupportedInTransaction', 'TransactionExceededLifetimeLimitSeconds']
 const TX_CODES = [72, 112, 117, 225, 244, 251, 256, 263, 290]
 const TX_LABELS = ['TransientTransactionError', 'UnknownTransactionCommitResult']
@@ -265,41 +264,16 @@ export function isDatabaseError(error: unknown): boolean {
   const r = walk(error, ownDatabaseError)
   return r.hit || r.incomplete
 }
-
-/**
- * Mongo's own words for a killed or aborted session or transaction. Bulk `errors` entries and wrapped errors carry only
- * a message, so this is the last line of defense. The list is short on purpose: ordinary refusal text such as "Use a
- * replica set" or "You are not allowed to perform this action" must not match.
- */
-const DATABASE_MESSAGE = /NoSuchTransaction|WriteConflict|TransactionTooOld|TransientTransactionError|UnknownTransactionCommitResult|ConflictingOperationInProgress|Transaction numbers are only allowed on a replica set|Transactions are not supported|does not support (?:retryable writes|sessions|transactions)|in-progress transactions?|Given transaction number|multi-document transaction|retry your operation|use of expired sessions|operation was interrupted|\bwrite conflict\b|No transaction started|Read preference in a transaction|Cannot call (?:commit|abort)Transaction after calling (?:commit|abort)Transaction|\btxnNumber\b|\blsid\b|:: caused by ::|\b(?:abortTransaction|commitTransaction|withTransaction|ClientSession)\b|\btimeoutMS\b|\btxn(?:Id|Nums?)\b|operation exceeded time limit|\blogical session\b|\bE11000\b|duplicate key|\bserver session\b|\bconnection\b[^.]{0,80}\b(?:closed|reset|refused|pool)\b|\bconnection pool\b|\bsocket\b|\bECONN\w+|\bnot primary\b|server selection|Topology was destroyed|\bMongo(?:Network|Server|Server[A-Z]\w*)Error\b|\bcursor id\b|Executor error|\bwriteConcern\b|\bsystem collection\b|\bmulti-statement\b|\bwithin a (?:multi-\w+ )?transaction\b|\b(?:not allowed|cannot be (?:run|used)|is not supported) (?:in|within|inside) (?:a |an )?(?:multi-\w+ )?transactions?\b/i
-/** Pairs of words that together read as a driver fault. Tested apart, with no character window, so a long real message still matches. */
-const DATABASE_MESSAGE_PAIRS: [RegExp, RegExp][] = [
-  [/\btransactions?\b/i, /\b(?:has|have) been (?:aborted|committed)\b|\bwas (?:aborted|committed)\b|\balready (?:aborted|committed)\b|\blifetime\b/i],
-  [/\bsession\b/i, /\bwas (?:killed|ended)\b|\b(?:has|have) ended\b|\bended session\b/i],
-  [/\bsession\s+(?:id\s+)?[0-9a-f-]{8,}/i, /\bexpired\b|\bended\b/i],
-  [/\bnewer transaction\b/i, /\balready started\b|\bCannot start transaction\b/i],
-  [/\bTransaction\b/i, /\balready in progress\b/i],
-]
-/** Whether a message reads like the database's own session or transaction failure (see `DATABASE_MESSAGE`). */
-export function isDatabaseErrorMessage(message: string): boolean {
-  return DATABASE_MESSAGE.test(message) || DATABASE_MESSAGE_PAIRS.some(([a, b]) => a.test(message) && b.test(message))
-}
-/** Whether the error's message, or the message of anything nested in it (bounded depth, each object once), is the database's own. An unfinished walk says true. */
-function databaseMessageIn(error: unknown): boolean {
-  const r = walk(error, (n) => isDatabaseErrorMessage(n.text) || (typeof n.errmsg === 'string' && isDatabaseErrorMessage(n.errmsg)))
-  return r.hit || r.incomplete
-}
-
 /**
  * Wraps a caller's own `isRefusal` so a database or transaction error is never a refusal, whatever the caller's
- * predicate says. The database test (error fields and Mongo's message words) runs first; the predicate only sees
+ * predicate says. The database test (error fields) runs first; the predicate only sees
  * errors that pass it.
  */
 function guardRefusal(custom: ((error: unknown) => boolean) | undefined): (error: unknown) => boolean {
   if (!custom) return isRefusal
   return (error) => {
     try {
-      return !isDatabaseError(error) && !databaseMessageIn(error) && custom(error)
+      return !isDatabaseError(error) && custom(error)
     } catch {
       return false
     }
@@ -315,30 +289,42 @@ export function isValidationError(error: unknown): boolean {
     return false
   }
 }
-
+/** The fixed value of `data.refusal` on the error a plugin throws when it refuses to run without transactions. */
+export const TRANSACTIONS_REQUIRED = 'transactions-required'
 /**
- * True when everything nested inside an error can be read and says no. Each nested node must be openable (no Proxy,
- * Symbol or hidden keys, class instance or cross-realm object) and carry a string message that `says` accepts. A
- * nested error with no string message (an object, an empty one, only a `code`, text only in `stack`), a container
- * that cannot be opened, or an unfinished walk means the wrapper may be hiding a fault: false, so not a refusal.
+ * The one error a plugin throws to say "this needs transactions, so I won't run". Whitehat trusts this marker and
+ * nothing a message says. The shape (class name, `data.refusal` and its value) is open to the Head of Tools.
  */
-function nestedAllRefuse(error: unknown, says: (message: string) => boolean): boolean {
-  const r = walk(error, (n, depth) => depth > 0 && (n.opaque || n.own === null || n.own === '' || !says(n.own)))
-  return !r.hit && !r.incomplete
+export class TransactionsRequired extends Error {
+  readonly data = { refusal: TRANSACTIONS_REQUIRED } as const
+  constructor(message = 'This needs database transactions, and they are off.') {
+    super(message)
+    this.name = 'TransactionsRequired'
+  }
+}
+const hasMarker = (error: unknown): boolean => {
+  try {
+    if (typeof error !== 'object' || error === null) return false
+    const data = (error as { data?: unknown }).data
+    return typeof data === 'object' && data !== null && (data as { refusal?: unknown }).refusal === TRANSACTIONS_REQUIRED
+  } catch {
+    return false
+  }
 }
 /**
- * Whether an error is a proper refusal: HTTP 401, 403 or 404, or Payload's Forbidden, UnauthorizedError and
- * NotFound. Not a refusal: a validation error (400, 422, ValidationError), a database or transaction error
- * (checked on the error and its `cause`, by name, `codeName` and `errorLabels`), a plain Error, a 5xx.
- * Anything nested inside it (`cause`, `errors` ...) must be readable and say no too: a 403 that wraps E11000, a closed
- * connection or a failed session is a database error, and one that wraps something unreadable is unknown.
+ * Whether an error is a refusal. Only two things count: the `TransactionsRequired` marker (`data.refusal` of
+ * 'transactions-required'), or an exact integer `status` or `statusCode` of 401, 403 or 404 with no nested error
+ * (`cause`, `errors` ...) and no database-driver fields. Nothing is judged by its message or name: a 'Forbidden' or
+ * 'NotFound' at any other status, a plain Error and every text are not refusals, and neither is a validation error.
  * Callers can pass their own `isRefusal` where the site refuses some other way.
  */
 export function isRefusal(error: unknown): boolean {
   try {
-    if (isDatabaseError(error) || databaseMessageIn(error) || isValidationError(error)) return false
-    if (!REFUSAL_STATUSES.includes(statusOf(error)) && !REFUSAL_NAMES.includes(String((error as { name?: unknown })?.name))) return false
-    return nestedAllRefuse(error, (m) => !isDatabaseErrorMessage(m))
+    if (hasMarker(error)) return true
+    if (typeof error !== 'object' || error === null || !REFUSAL_STATUSES.includes(statusOf(error))) return false
+    // Anything nested (even a cycle back to itself), anything unreadable, or a driver's own fields means "unknown".
+    const s = snapshot(error)
+    return !s.unreadable && s.children.length === 0 && !ownDatabaseError(s)
   } catch {
     return false
   }
@@ -537,47 +523,6 @@ export async function runResponseDifferenceProbe(input: { identities: [Viewer, V
 // ---------------------------------------------------------------------------------------------------------
 // 2. Settings that look on but aren't: transactions
 // ---------------------------------------------------------------------------------------------------------
-
-/** Words a plugin uses when it says no on purpose, as opposed to a transaction fault that merely mentions the word. */
-const REFUSAL_CUE = /\b(?:needs?|requires?|required|must|refus\w*|will not|won't|cannot|can't|unable|not (?:available|enabled|supported|allowed)|disabled|off|without|replica set)\b/i
-/** Plain advice a guard may add after saying no: it names the fix. */
-const REFUSAL_ADVICE = /\b(?:replica set|transactionOptions|enable|configure|turn (?:it |them )?on|restart|database adapter|start-?up)\b/i
-/**
- * Every sentence of a message must read as a refusal: it says no about transactions (a cue word) or gives advice. A
- * wrapper that appends driver text after a refusal sentence ("needs a transaction: E11000 ...") fails on that text.
- */
-const everySentenceRefuses = (message: string): boolean => {
-  const parts = message.split(/[.!?;:\n]+|\s[-\u2013\u2014]\s/).map((p) => p.trim()).filter(Boolean)
-  return parts.length > 0 && parts.every((p) => !isDatabaseErrorMessage(p) && ((/transaction/i.test(p) && REFUSAL_CUE.test(p)) || REFUSAL_ADVICE.test(p)))
-}
-const refusalText = (said: string): boolean => /transaction/i.test(said) && REFUSAL_CUE.test(said) && !isDatabaseErrorMessage(said) && everySentenceRefuses(said)
-/**
- * Under a refusal wrapper, every message nested inside it must itself read as a refusal. A driver text is too varied
- * to list, so anything nested that is not refusal-shaped means the wrapper may be hiding a fault: not a refusal.
- * An unfinished walk is unknown, so also not a refusal.
- */
-const nestedMessagesRefuse = (error: unknown): boolean => nestedAllRefuse(error, refusalText)
-/**
- * By default a refusal comes from the plugin saying no: an error with a refusal status (401, 403, 404) or name, or a
- * Payload `APIError` with a status of 401, 403 or 404 (any other status, 400 and 422 included, never counts), that mentions transactions and says no on purpose. A bare message from a plain Error is not
- * enough, since driver and wrapper faults are plain text too; give `refusal` your own pattern for that.
- */
-const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
-  const status = statusOf(error)
-  // A Payload APIError says no only with a 401, 403 or 404 status. Its default status is 500 and a bare one has none: neither is a refusal.
-  // Only a whole 401, 403 or 404 counts (not 408, 409, 429, 499 or 403.5), whatever the class.
-  const name = String((error as { name?: unknown })?.name)
-  const refusalShaped = REFUSAL_STATUSES.includes(status) || REFUSAL_NAMES.includes(name)
-  // The whole own message must read as a refusal, not just a part of it (the text with `data` appended is checked for driver words too).
-  let own: string | null = null
-  try {
-    own = snapshot(error).own
-  } catch {
-    own = null
-  }
-  return refusalShaped && refusalText(said) && own !== null && refusalText(own) && !isValidationError(error) && nestedMessagesRefuse(error)
-}
-
 /**
  * A plugin that relies on transactions must refuse to run without them. Payload starts without transactions
  * when the database adapter is given `transactionOptions: false` (the adapter's `beginTransaction` then returns
@@ -590,33 +535,30 @@ const DEFAULT_TX_REFUSAL = (said: string, error?: unknown) => {
  *   for the writes only. A guard that checks transactions once at start-up passes start-up and is caught here,
  *   as is a guard that reads `req.transactionID` without awaiting it.
  *
- * `refusal` says what a proper refusal looks like; by default an error with a refusal status (401, 403, 404) or an
- * APIError with a status of 401, 403 or 404 (no other status counts) that mentions transactions and says no on purpose (needs, requires, must, refuses, cannot, without, off,
- * replica set), but isn't one of the database's own. A plain Error with only a message is not-checked by default. Real driver errors (NoSuchTransaction, WriteConflict, "Transaction numbers are only
- * allowed on a replica set member") are recognized by `codeName`, `code`, `errorLabels` and `cause`, and by Mongo's
- * own message words (also in a nested `cause` or `errorResponse`) when a wrapper kept only the text, and a database error is never a refusal, whatever `refusal` matches. A validation error is
- * not one by default. Any other error is "not checked".
+ * `refusal` replaces `isRefusal` where the site refuses some other way: it gets the error, and a database error is never a
+ * refusal whatever it says. By default only the `TransactionsRequired` marker or a bare 401, 403 or 404 counts (see
+ * `isRefusal`). Any other error, text included, is "not-checked".
  */
 export async function runTransactionCheck(input: {
   start: () => Promise<{ payload: Payload; stop?: () => Promise<void> }>
   /** A write the plugin protects with a transaction, made on the instance `start` returned. */
   write: (payload: Payload) => Promise<unknown>
   mode?: 'off-at-start' | 'null-after-start'
-  refusal?: RegExp | ((said: string, error: unknown) => boolean)
+  refusal?: (error: unknown) => boolean
   severity?: Severity
 }): Promise<Finding[]> {
   const sev = input.severity ?? 'high'
   const mode = input.mode ?? 'off-at-start'
   const check = 'transactions-required'
   const title = mode === 'off-at-start' ? 'A plugin that needs transactions refuses to run without them' : 'A plugin that needs transactions refuses a write when beginTransaction answers null'
-  const refuses = (said: string, error: unknown): boolean => {
+  const refuses = (error: unknown): boolean => {
     try {
-      return refusesUnsafe(said, error)
+      return refusesUnsafe(error)
     } catch {
-      return false // a property or a caller's pattern threw: nothing was learned
+      return false // a property or the caller’s function threw: nothing was learned
     }
   }
-  const refusesUnsafe = (said: string, error: unknown) => !isDatabaseError(error) && !isDatabaseErrorMessage(said) && !databaseMessageIn(error) && (input.refusal instanceof RegExp ? input.refusal.test(said) : (input.refusal ?? DEFAULT_TX_REFUSAL)(said, error))
+  const refusesUnsafe = (error: unknown) => !isDatabaseError(error) && (input.refusal ?? isRefusal)(error)
   const role = 'server'
   let started: Awaited<ReturnType<typeof input.start>> | undefined
   let restore: (() => void) | undefined
@@ -625,7 +567,7 @@ export async function runTransactionCheck(input: {
       started = await input.start()
     } catch (e) {
       const said = messageOf(e)
-      if (mode === 'off-at-start' && refuses(said, e)) return [{ check, title, severity: sev, status: 'pass', role, path: 'start-up', how: 'It refused to start without transactions.' }]
+      if (mode === 'off-at-start' && refuses(e)) return [{ check, title, severity: sev, status: 'pass', role, path: 'start-up', how: 'It refused to start without transactions.' }]
       return [note(check, title, role, `Start-up failed for another reason: ${clip(said, 120)}`, 'start-up', sev)]
     }
     const { payload } = started
@@ -650,7 +592,7 @@ export async function runTransactionCheck(input: {
       await input.write(payload)
     } catch (e) {
       const said = messageOf(e)
-      return refuses(said, e)
+      return refuses(e)
         ? [{ check, title, severity: sev, status: 'pass', role, path: 'write', how: 'The write was refused because transactions are off.' }]
         : [note(check, title, role, `The write failed for another reason: ${clip(said, 120)}`, 'write', sev)]
     }
@@ -699,12 +641,10 @@ export type ProtectedCollection = {
  * since a typo in `data` would otherwise read as a lock. That control write is undone by `seed`.
  *
  * Only a recognized refusal passes as a refusal (see `isRefusal`). Any other error, and any bulk error entry
- * that isn't one, are "not-checked". A bulk `errors` entry only has a message, so it counts as refused only
- * when `isRefusal` accepts it (a `status` or `name` on the entry) or its message is Payload's standard "not
- * allowed to perform this action" or says forbidden. Pass your own `isRefusal` for any other wording. Whatever you pass, a database or
- * transaction error is never a refusal: it is tested first, by `codeName`, `code`, `errorLabels` and `cause`, and by
- * Mongo's message words (NoSuchTransaction, WriteConflict, "Transaction ... has been aborted", "operation was
- * interrupted", "session ... was killed"), which matters for a bulk entry that only has a message.
+ * that isn't one, are "not-checked". A bulk `errors` entry counts as refused only when `isRefusal` accepts it (the
+ * marker, or a bare 401, 403 or 404 on the entry). Its message is never read: Payload's own bulk entries carry only
+ * text, so they are "not-checked" until the plugin adds a status or the marker. Pass your own `isRefusal` for any other
+ * shape. A database error is never a refusal whatever you pass: it is tested first, by `codeName`, `code`, `errorLabels` and `cause`.
  */
 export async function runServerBackDoorCheck(payload: Payload, collections: ProtectedCollection[], options: { isRefusal?: (error: unknown) => boolean } = {}): Promise<Finding[]> {
   const out: Finding[] = []
@@ -719,7 +659,7 @@ export async function runServerBackDoorCheck(payload: Payload, collections: Prot
     const bulk = (r: unknown): Ran => {
       const res = r as Result
       const errors = res.errors ?? []
-      const other = errors.find((e) => !refusal(e) && (isDatabaseErrorMessage(String(e?.message)) || !/not allowed to perform|forbidden/i.test(String(e?.message))))
+      const other = errors.find((e) => !refusal(e))
       if (other) throw Object.assign(new Error(`bulk operation error: ${clip(messageOf(other), 80)}`), { crash: true })
       return { refused: (res.docs?.length ?? 0) === 0 && errors.length > 0 }
     }
