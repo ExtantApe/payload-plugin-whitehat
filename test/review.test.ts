@@ -713,6 +713,43 @@ describe('round 12: a refusal is the marker or a bare 401, 403 or 404, and nothi
     const getter403 = Object.defineProperty(Object.assign(new Error('x'), { status: 403 }), 'statusCode', { get: () => 500, enumerable: true })
     expect(isRefusal(getter403)).toBe(false)
   })
+  it('round 15 A: an inherited status or statusCode makes the error unknown, on both paths', () => {
+    const inh = (key: string, val: unknown, own: object) => Object.assign(Object.create(Object.assign(Object.create(Error.prototype), { [key]: val })), { message: 'x' }, own)
+    expect(isRefusal(inh('status', 500, { statusCode: 403 }))).toBe(false)
+    expect(isRefusal(inh('status', 403, { statusCode: 403 }))).toBe(false)
+    expect(isRefusal(inh('statusCode', 500, { status: 403 }))).toBe(false)
+    class E extends Error { get status() { return 500 } }
+    expect(isRefusal(Object.assign(new E('x'), { statusCode: 403 }))).toBe(false)
+    expect(isRefusal(Object.assign(new E('x'), { statusCode: 403, data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(false)
+    expect(isRefusal(Object.assign(Object.create(Object.assign(Object.create(Error.prototype), { status: 403 })), { data: { refusal: TRANSACTIONS_REQUIRED } }))).toBe(false)
+  })
+  it('round 15 B: an inherited data, cause, errors or nested key, or a non-text message or name, is unknown', () => {
+    const mongo = Object.assign(new Error('x'), { name: 'MongoNetworkError' })
+    for (const key of ['data', 'cause', 'errors', 'originalError', 'errorResponse', 'writeErrors', 'result']) {
+      const proto = Object.assign(Object.create(Error.prototype), { [key]: key === 'errors' ? [mongo] : { errors: [mongo] } })
+      const e = Object.assign(Object.create(proto), { message: 'x', status: 403 })
+      expect(isRefusal(e), key).toBe(false)
+      if (key !== 'data') expect(isRefusal(Object.assign(Object.create(proto), { message: 'x', status: 403, data: { refusal: TRANSACTIONS_REQUIRED } })), key).toBe(false)
+    }
+    const msgGetter = Object.assign(Object.create(Object.defineProperty(Object.create(Error.prototype), 'message', { get: () => 'MongoNetworkError' })), { status: 403 })
+    expect(isRefusal(msgGetter)).toBe(false)
+    const nameObj = Object.assign(Object.create(Object.assign(Object.create(Error.prototype), { name: { toString: () => 'x' } })), { message: 'x', status: 403 })
+    expect(isRefusal(nameObj)).toBe(false)
+    const proxied = Object.assign(Object.create(new Proxy(Error.prototype, {})), { message: 'x', status: 403 })
+    expect(isRefusal(proxied)).toBe(false)
+  })
+  it('round 15: plain inheritance (subclass, inherited text name or message) still passes', () => {
+    class Plain extends Error { constructor(m: string) { super(m); this.name = 'Plain' } }
+    expect(isRefusal(Object.assign(new Plain('No'), { status: 403 }))).toBe(true)
+    const proto = Object.assign(Object.create(Error.prototype), { name: 'Custom', message: 'No' })
+    expect(isRefusal(Object.assign(Object.create(proto), { status: 404 }))).toBe(true)
+  })
+  it('round 15 C: a stack accessor that gives text is accepted, one that gives a non-text value is not', () => {
+    const ok = Object.defineProperty(Object.assign(new Error('x'), { status: 403 }), 'stack', { get: () => 'text', enumerable: false, configurable: true })
+    expect(isRefusal(ok)).toBe(true)
+    const bad = Object.defineProperty(Object.assign(new Error('x'), { status: 403 }), 'stack', { get: () => ({}), enumerable: false, configurable: true })
+    expect(isRefusal(bad)).toBe(false)
+  })
   it('a refusal option of the wrong type is a config error, not a quiet not-checked', async () => {
     for (const bad of [/403/, 'forbidden', 42, null, {}]) {
       await expect(runTransactionCheck({ start: async () => { throw marker() }, write: async () => undefined, refusal: bad as never })).rejects.toThrow(/config error.*"refusal"/)

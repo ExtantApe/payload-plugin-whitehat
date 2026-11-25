@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-24 (round 15): nothing from the prototype chain
+
+Suite: round 14's 116 plus 4 new tests (`npx vitest run`).
+
+- **Covered.** An inherited `status` or `statusCode` (data property or class getter) beside an own 403 is unknown on the bare and marker paths. An inherited `data`, `cause`, `errors`, `originalError`, `errorResponse`, `writeErrors` or `result` holding a driver error is unknown. An inherited `message` getter, a non-text inherited `name` and a Proxy prototype are unknown. A subclass and an inherited text name and message still pass. A `stack` accessor that gives text passes and one that gives an object does not.
+- **Gaps.** The three host plugins' own throws belong in those repos.
+- **Skipped.** Nothing new.
+
 ## 2026-11-24 (round 14): values in the allow-list, conflicting statuses
 
 Suite: 116 tests after (`npx vitest run`). Round 12 and 13 entries below stay as written; round 13's `TransactionsRequired` class tests were removed in round 13.

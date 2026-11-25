@@ -304,8 +304,27 @@ const ownValue = (o: object, key: string): unknown => {
  * The own-key allow-list: no Proxy, no symbol keys, and every own key is one of REFUSAL_OWN_KEYS, or `cause` when it
  * is `data` itself (Payload's APIError sets `cause: data`). Anything else may carry a nested error, so it is unknown.
  */
+const INHERITED_BANNED = ['data', 'status', 'statusCode', ...NESTED_KEYS]
+/**
+ * Nothing the walk or the status reads may come from the prototype chain: no data, status, statusCode or nested-error
+ * key beyond what the error owns, and every inherited `message` or `name` is plain text. Fails closed on a Proxy
+ * in the chain or a chain longer than 50.
+ */
+const plainInheritance = (error: object): boolean => {
+  for (const k of INHERITED_BANNED) if (k in error && !Object.prototype.hasOwnProperty.call(error, k)) return false
+  let p = Object.getPrototypeOf(error)
+  for (let i = 0; p !== null; i++, p = Object.getPrototypeOf(p)) {
+    if (i > 50 || utilTypes.isProxy(p)) return false
+    for (const k of ['message', 'name']) {
+      const d = Object.getOwnPropertyDescriptor(p, k)
+      if (d && (!('value' in d) || typeof d.value !== 'string')) return false
+    }
+  }
+  return true
+}
 const plainRefusalKeys = (error: object): boolean => {
   if (utilTypes.isProxy(error)) return false
+  if (!plainInheritance(error)) return false
   const keys = Reflect.ownKeys(error)
   const data = ownValue(error, 'data')
   const namesOk = keys.every((k) => typeof k === 'string' && (REFUSAL_OWN_KEYS.includes(k) || (k === 'cause' && 'value' in (Object.getOwnPropertyDescriptor(error, k) ?? {}) && ownValue(error, 'cause') === data)))
