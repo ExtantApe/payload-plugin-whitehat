@@ -720,7 +720,7 @@ export async function runTransactionCheck(input: {
   refusal?: (error: unknown) => boolean
   severity?: Severity
 }): Promise<Finding[]> {
-  if (input.refusal !== undefined && typeof input.refusal !== 'function') throw new Error(`runTransactionCheck config error: option "refusal" must be a function that takes the error, not ${input.refusal === null ? 'null' : typeof input.refusal === 'object' ? Object.prototype.toString.call(input.refusal) : typeof input.refusal}.`)
+  if (input.refusal !== undefined && typeof input.refusal !== 'function') throw new Error(`runTransactionCheck config error: option "refusal" must be a function that takes the error, not ${input.refusal === null ? 'null' : typeof input.refusal === 'object' ? (Array.isArray(input.refusal) ? 'an array' : 'an object') : typeof input.refusal}.`)
   const sev = input.severity ?? 'high'
   const mode = input.mode ?? 'off-at-start'
   const check = 'transactions-required'
