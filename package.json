@@ -1,6 +1,6 @@
 {
   "name": "@extantape/payload-plugin-whitehat",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Whitehat for Payload: finds security holes in a Payload site, its database, code and UI, with severity-ranked alerts and a checklist that grows with every incident.",
   "homepage": "https://github.com/ExtantApe/payload-plugin-whitehat#readme",
   "bugs": {
