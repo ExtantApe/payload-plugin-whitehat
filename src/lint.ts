@@ -13,6 +13,10 @@ import type { Finding } from './index.js'
  *    Payload runs the find and its count at once on the same Mongo session, and as a transaction's first
  *    query that fails with NoSuchTransaction. `findByID`, `pagination: false` and a find that follows another
  *    query in the same function are skipped. It reads every source file, since helpers are called from hooks.
+ * 3. A Payload local API call that passes both `context` and the shared `req`. Payload merges that context
+ *    into `req.context`, and it stays there for every later operation on the request, so a skip flag meant
+ *    for one internal write switches the plugin's hooks off for the rest of the request. A `req` made with
+ *    `isolateObjectProperty(req, ['context'])`, in the call or assigned to `req` earlier in the file, is skipped.
  */
 
 /** Blanks comments and keeps every newline, so line numbers stay right. */
@@ -118,6 +122,17 @@ export function lintSource(path: string, source: string, shared: Map<string, str
     if (paginationOff(call, objects)) continue
     if (earlierQuery(src, enclosingStart(src, m.index!), m.index!)) continue
     add('paginated-find-in-transaction', 'A paginated find with req may be a transaction’s first query', m.index!, 'payload.find runs its query and its count at once; as the first query on a transaction’s one Mongo session that throws NoSuchTransaction. Add pagination: false, or use a single query. (Heuristic: it can’t see whether a transaction is open, or what called this function.)')
+  }
+
+  // 3. context with the shared req. Payload's createLocalReq merges the call's context into req.context.
+  const localCall = /\.(?:find|findByID|findOne|count|create|update|delete|duplicate|findGlobal|updateGlobal|findVersions|restoreVersion)\s*\(/g
+  for (let m = localCall.exec(src); m; m = localCall.exec(src)) {
+    const call = balanced(src, m.index! + m[0].length - 1)
+    if (!/[{,]\s*context\s*[:,}]/.test(call)) continue
+    if (!/[{,]\s*req\s*(?:[,}]|:\s*(?:[\w$]+\.)*req\b(?!\s*[.(]))/.test(call)) continue
+    if (/isolateObjectProperty/.test(call)) continue
+    if (/\breq\s*=\s*isolateObjectProperty\s*\(/.test(src.slice(0, m.index!))) continue
+    add('context-on-shared-req', 'A local API call sets context on the shared req', m.index!, 'Passing context with req merges it into req.context, and it stays there for every later operation on the request, so a skip flag meant for this call turns hooks off for the rest of it. Pass req: isolateObjectProperty(req, [\'context\']) instead. (Heuristic: it can’t tell whether the request is used again.)')
   }
   return out
 }

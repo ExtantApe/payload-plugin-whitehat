@@ -1,6 +1,6 @@
 import { types as utilTypes } from 'node:util'
 
-import type { Payload } from 'payload'
+import { createLocalReq, type Payload, type PayloadRequest } from 'payload'
 
 import type { Finding, Severity, Viewer } from './index.js'
 
@@ -1083,4 +1083,54 @@ export async function runHostRuleCheck(options: HostRuleOption[]): Promise<Findi
     }
   }
   return out
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// 5. Flags left on the caller's req.context
+// ---------------------------------------------------------------------------------------------------------
+
+/**
+ * A local API call that passes both `req` and `context` merges that context into the shared `req.context`, and
+ * it stays there after the call. A plugin that sets a skip flag this way (`context: { skipMyHooks: true }`) for
+ * one internal write leaves it on the request, and every later operation on that request skips the plugin's
+ * hooks, its guards included. The fix is `req: isolateObjectProperty(req, ['context'])` on the internal call.
+ *
+ * The check makes a local request with a marker in its context, runs `operation` with it (use a write that
+ * fires the plugin's hooks; a bulk update of two or more documents shows a flag set by the first and read by
+ * the second), and compares `req.context` before and after. A key that was added, removed or changed is the
+ * finding. An operation that throws is "not-checked", since it may have stopped before the flag was set.
+ * `ignore` lists keys the host itself sets on purpose. Values are compared by identity, one level deep.
+ */
+export async function runContextLeakCheck(input: {
+  payload: Payload
+  /** The plugin operation, made with `req` the way a host would make it. */
+  operation: (req: PayloadRequest) => Promise<unknown>
+  /** Optional user for the request. */
+  user?: unknown
+  /** Context keys that are allowed to change. */
+  ignore?: string[]
+  severity?: Severity
+}): Promise<Finding[]> {
+  const check = 'context-flag-leak'
+  const title = 'A plugin operation leaves flags on the caller’s req.context'
+  const sev = input.severity ?? 'high'
+  const role = 'server'
+  const ignore = new Set(input.ignore ?? [])
+  let req: PayloadRequest
+  try {
+    req = await createLocalReq({ user: input.user as never, context: { whitehatContextProbe: true } }, input.payload)
+  } catch (e) {
+    return [note(check, title, role, `Couldn’t make a local request: ${clip(messageOf(e), 120)}`, 'operation', sev)]
+  }
+  const before = { ...(req.context ?? {}) } as Record<string, unknown>
+  try {
+    await input.operation(req)
+  } catch (e) {
+    return [note(check, title, role, `The operation failed, so it may have stopped before setting anything: ${clip(messageOf(e), 120)}`, 'operation', sev)]
+  }
+  const after = (req.context ?? {}) as Record<string, unknown>
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)])
+  const changed = [...keys].filter((k) => !ignore.has(k) && (!(k in after) || !(k in before) || !Object.is(before[k], after[k]))).sort()
+  if (changed.length === 0) return [{ check, title, severity: sev, status: 'pass', role, path: 'operation', how: 'req.context was the same before and after the operation.' }]
+  return [{ check, title, severity: sev, status: 'fail', role, path: 'operation', how: `req.context changed during the operation: ${changed.map((k) => (k in after ? (k in before ? `${k} changed` : `${k} added`) : `${k} removed`)).join(', ')}. A later operation on the same request sees ${changed.length === 1 ? 'it' : 'them'}. Pass req: isolateObjectProperty(req, ['context']) on internal calls that set context.`, reproduce: 'Make the operation with a request, then read req.context: the keys above are still there.' }]
 }
