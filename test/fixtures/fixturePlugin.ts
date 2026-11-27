@@ -26,10 +26,12 @@ export const state = {
   looseVeto: false,
   /** A veto that only refuses on an exact true, and ignores every other answer. */
   trueOnlyVeto: false,
+  /** The floor for sealed accounts. Unset holds it against every host answer; set, it is the broken variant, and says which answers open it. */
+  floorOpens: undefined as undefined | ((answer: unknown) => boolean),
   /** Every guarded write dies with a database error, as a transaction failure would. */
   crash: false,
   /** Host hooks. */
-  host: {} as { allowClosed?: (id: string) => unknown; vetoInvite?: (id: string) => unknown },
+  host: {} as { allowClosed?: (id: string) => unknown; allowSealed?: (id: string) => unknown; vetoInvite?: (id: string) => unknown },
   /** How the plugin treats transactions being off: do nothing, refuse at start-up, or refuse writes. */
   transactions: 'ignored' as 'ignored' | 'startup' | 'write',
   /** After a note changes, log an event with a skip flag in context: not at all, on the shared req, or on an isolated one. */
@@ -121,7 +123,14 @@ const invites: CollectionConfig = {
           if (state.leakyEvents) await log('vetoed')
           throw new APIError(state.leakyMessage ? 'This person is a minor and cannot be invited.' : 'This person cannot be invited.', 403)
         }
-        const person = (await req.payload.findByID({ collection: 'users', id: target, depth: 0, overrideAccess: true, disableErrors: true })) as { closed?: boolean } | null
+        const person = (await req.payload.findByID({ collection: 'users', id: target, depth: 0, overrideAccess: true, disableErrors: true })) as { closed?: boolean; sealed?: boolean } | null
+        if (person?.sealed) {
+          // The plugin's own floor. The host is asked, and nothing it says may open it.
+          const answer = await Promise.resolve()
+            .then(() => state.host.allowSealed?.(target))
+            .catch(() => undefined)
+          if (state.floorOpens?.(answer) !== true) throw new APIError('This person cannot be invited.', 403)
+        }
         if (person?.closed) {
           let widened = false
           try {

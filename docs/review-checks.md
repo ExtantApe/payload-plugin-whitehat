@@ -69,7 +69,7 @@ Bulk operations report refusals in an `errors` list whose entries have only a me
 
 ## 4. `runHostRuleCheck`
 
-For each host access or veto option: `install(answer)` sets the host's answer (`HOST_ANSWERS`: `true`, `{}`, null, 0, an empty string, a throw, a narrow where, 1, `'yes'`, `[]`, false, undefined and a function), and `attempt` does something the plugin's default refuses. With no host answer the attempt must be refused (otherwise `not-checked`). After that only answers in `mayWiden` (default `['true']`) may turn it into an allow. Everything else, a function included, must keep the default. A `veto` option follows the strict-answers rule below. `install(undefined)` runs first and last, so the option is put back.
+For each host access or veto option: `install(answer)` sets the host's answer (`HOST_ANSWERS`: `true`, `{}`, null, 0, an empty string, a throw, a narrow where, 1, `'yes'`, `[]`, false, undefined and a function), and `attempt` does something the plugin's default refuses. With no host answer the attempt must be refused (otherwise `not-checked`). After that only answers in `mayWiden` (default `['true']`) may turn it into an allow. Everything else, a function included, must keep the default. For a plugin's own floor, a rule no host may open, pass `mayWiden: []`: then every answer, `true`, `{}` and null included, must keep the refusal. Leaving `mayWiden` out lets `true` widen it, and the check would report that as a pass. A `veto` option follows the strict-answers rule below. `install(undefined)` runs first and last, so the option is put back.
 
 For a veto hook, set `kind: 'veto'`. The rule is different: `attempt` is something the default allows, and only the answers in `goAhead` (default `null` and `undefined`) may leave it allowed. `goAhead` takes only `null`, `undefined` and `false`; any other entry throws a config error before anything runs. Every other answer must refuse it: `true`, a reason string, `{}`, `[]`, 1, 0, an empty string, false, a function, a narrow where and a throw (a broken veto fails closed). If a plugin documents another answer as go ahead, list it in `goAhead`; the report then says that answer was allowed by contract. Put the veto's own moment in `attempt`: if the host veto runs when the holder accepts a grant (as the positions plugin's does), `attempt` must make the holder accept it. A probe that tests the veto when someone grants would see nothing, and a granter could not learn the veto's answer anyway.
 
@@ -77,11 +77,7 @@ For a veto hook, set `kind: 'veto'`. The rule is different: `attempt` is somethi
 
 A heuristic read of source text (never an edit) of every source file, helpers included. It flags a host hook's answer used as a truth value instead of `=== true`, a paginated `payload.find` passing `req`, without `pagination: false`, as the first query of its function, and a local API call that passes both `context` and the shared `req` (`context-on-shared-req`). A `req` made with `isolateObjectProperty(req, ['context'])`, in the call or assigned to `req` earlier in the file, is skipped. A find that follows another query in the same function is skipped. Each hit names `file:line`. Limits: it can't see whether a transaction is open or what calls the function, it doesn't follow calls into other functions, and it misses a host hook held under another name. A hit says look here; a clean run isn't proof.
 
-```ts
-it('has no known review-finding patterns', () => {
-  expect(lintDirectory(new URL('../src', import.meta.url).pathname).filter((f) => f.status === 'fail')).toEqual([])
-})
-```
+To run it on every PR, use the test file in [Running the lint in CI](#running-the-lint-in-ci).
 
 ## 6. `runContextLeakCheck`
 
@@ -98,6 +94,30 @@ const [finding] = await runContextLeakCheck({
 ```
 
 The fix in the plugin is `req: isolateObjectProperty(req, ['context'])` (exported by `payload`) on the internal call. It only sees what one operation leaves behind, so give it the operations that run your hooks: a bulk update, a create, a delete.
+
+## Running the lint in CI
+
+The lint needs no Payload instance or database. Add `@extantape/payload-plugin-whitehat` as a dev dependency and save this as `test/whitehat-lint.test.ts`:
+
+```ts
+import { fileURLToPath } from 'node:url'
+
+import { formatReport, lintDirectory } from '@extantape/payload-plugin-whitehat'
+import { expect, it } from 'vitest'
+
+it('Whitehat reads the plugin source and finds nothing', () => {
+  const findings = lintDirectory(fileURLToPath(new URL('../src', import.meta.url)))
+  // Anything but a pass fails, not-checked included.
+  expect(findings.filter((f) => f.status !== 'pass'), formatReport(findings)).toEqual([])
+  // A clean result over no files proves nothing. The pass finding says how many files were read.
+  const read = Number(/^Read (\d+) files?;/.exec(findings[0]?.how ?? '')?.[1] ?? 0)
+  expect(read, 'Whitehat read no source files').toBeGreaterThan(0)
+})
+```
+
+`lintDirectory` reports a pass for a folder with no source files, so keep the second assertion. If a later version words that finding differently, the count reads as 0 and the test fails. Point the path at the folder that holds the plugin's source. A folder that doesn't exist throws, which fails the test too.
+
+It runs on every PR when both of these are true: the repo's Vitest `include` pattern picks up the file, and the CI workflow triggers on `pull_request` and runs `npm test` (or `pnpm -r test`) after installing dependencies. Open the first PR's log and check that the file is listed.
 
 ## Running them in a plugin PR
 
