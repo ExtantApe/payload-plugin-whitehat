@@ -2,6 +2,22 @@
 
 Newest first.
 
+## 2026-11-27 (K891, lint fixes)
+
+Suite: 134 plus 17 new tests (151, `npx vitest run`).
+
+- Covered in `test/lintShapes.test.ts`: a folder with no source files (also one holding only tests, type declarations and `node_modules`) is not-checked, and a clean folder with source passes. Code that only looks safe is still flagged: a method named like a host hook is flagged on the plugin's own class, after a bracket, `defineProperty` or `Object.assign` reassignment, and with a same-named type from another import; a paged find is flagged in a GET endpoint, inside a callback given `req`, beside a spread over `method`, and with a brace in a string before a write.
+- Covered in `test/lintCiExample.test.ts`, which runs the CI example's code as the docs print it: allowed hits pass; it fails on a hit with no entry, one identical hit too many, an entry that matches nothing, a different file, rule or line text, a blank reason, and a run that read no files.
+- Gaps skipped: the example inside another repo's Vitest setup. An allow entry doesn't pin the lines around the flagged one, and the docs say so.
+
+## 2026-11-27 (K891): a floor no host answer may widen
+
+Suite: 129 plus 5 new tests (134, `npx vitest run`).
+
+- **Covered.** With `mayWiden: []`, a fixture floor that holds against every host answer passes (`true`, `{}` and null checked by name). Broken variants that open on an exact true, on a truthy answer and on null each fail. The default `mayWiden` passes the exact-true variant, which is why a floor needs the empty list. Two temporary breaks were tried and undone: a checker that always lets `true` widen failed two of the new tests, and a fixed fixture that opens on `true` failed the passing one.
+- **Gaps.** No real plugin's floor is probed here; each plugin repo does that in its own tests. The copyable lint test in `docs/review-checks.md` was run once by hand against a folder with findings, an empty folder and a clean folder; it isn't part of this suite.
+- **Skipped.** The other host answers against each broken variant, since the all-answers pass test and the three failing variants cover them.
+
 ## 2026-11-24 (round 18): no toStringTag read
 
 Suite: 123 plus 1 new test (124, `npx vitest run`). The new test fails on 6a46540.

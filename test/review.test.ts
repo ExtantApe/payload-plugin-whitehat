@@ -18,7 +18,7 @@ const config = async (db: string, transactions: boolean) =>
     telemetry: false,
     typescript: { autoGenerate: false },
     db: mongooseAdapter({ url: mongo.getUri(db), ensureIndexes: true, ...(transactions ? {} : { transactionOptions: false as const }) }),
-    collections: [{ slug: 'users', auth: true, fields: [{ name: 'closed', type: 'checkbox' }, { name: 'minor', type: 'checkbox' }] }],
+    collections: [{ slug: 'users', auth: true, fields: [{ name: 'closed', type: 'checkbox' }, { name: 'sealed', type: 'checkbox' }, { name: 'minor', type: 'checkbox' }] }],
     plugins: [fixturePlugin()],
   })
 /** Boots an instance. One whose start-up throws is closed before the error goes on, so no connection is left open. */
@@ -36,6 +36,7 @@ const boot = async (key: string, transactions: boolean) => {
 const reset = () => {
   state.leakyMessage = state.leakyEvents = state.truthyHost = state.bulkHole = state.accessOnly = state.txHole = state.looseVeto = state.trueOnlyVeto = state.silentLock = state.crash = false
   state.host = {}
+  state.floorOpens = undefined
   state.transactions = 'ignored'
   state.contextLeak = 'off'
 }
@@ -48,6 +49,7 @@ const bad = (fs: Finding[]) => fs.filter((f) => f.status !== 'pass').map((f) => 
 let actor: Viewer & { id: string }
 let minor: Viewer & { id: string }
 let closed: Viewer & { id: string }
+let sealed: Viewer & { id: string }
 let owner: Viewer & { id: string }
 
 beforeAll(async () => {
@@ -56,6 +58,7 @@ beforeAll(async () => {
   actor = await user('actor')
   minor = await user('minor', { minor: true })
   closed = await user('closed', { closed: true })
+  sealed = await user('sealed', { sealed: true })
   owner = await user('owner')
 })
 afterAll(async () => {
@@ -304,6 +307,42 @@ describe('4. host rules that replace defaults', () => {
     state.host.allowClosed = undefined
     const inMiddle = await runHostRuleCheck([option({ attempt: async () => { if (state.host.allowClosed) throw new Error('NoSuchTransaction') ; throw Object.assign(new Error('No'), { status: 403 }) } })])
     expect(inMiddle.filter((f) => f.status === 'pass')).toEqual([])
+  })
+  describe('a floor no host answer may widen (mayWiden: [])', () => {
+    const floor = (extra: object = {}) =>
+      option({
+        id: 'allowSealed',
+        install: (answer: HostAnswer | undefined) => {
+          state.host.allowSealed = answer ? async () => { if (answer.throws) throw answer.value; return answer.value } : undefined
+        },
+        attempt: () => payload.create({ collection: 'invites' as never, data: { target: sealed.id } as never, user: actor.user as never, overrideAccess: false }),
+        mayWiden: [],
+        ...extra,
+      })
+    it('passes a floor that holds for every answer, true, {} and null included', async () => {
+      const out = await runHostRuleCheck([floor()])
+      expect(out).toHaveLength(HOST_ANSWERS.length)
+      expect(bad(out)).toEqual([])
+      for (const name of ['true', 'empty-object', 'null']) expect(out.find((f) => f.path === `allowSealed · ${name}`)).toMatchObject({ status: 'pass', how: 'The default restriction still applied.' })
+    })
+    it('fails a floor that an exact true widens', async () => {
+      state.floorOpens = (answer) => answer === true
+      const out = await runHostRuleCheck([floor()])
+      expect(names(out)).toEqual(['true'])
+      expect(out.find((f) => f.path === 'allowSealed · true')).toMatchObject({ status: 'fail', severity: 'high', how: 'A host answer of true switched a default restriction off.' })
+    })
+    it('needs the empty list: the default mayWiden lets that same broken floor pass', async () => {
+      state.floorOpens = (answer) => answer === true
+      expect(bad(await runHostRuleCheck([floor({ mayWiden: undefined })]))).toEqual([])
+    })
+    it('fails a floor that {} widens', async () => {
+      state.floorOpens = (answer) => Boolean(answer)
+      expect(names(await runHostRuleCheck([floor()]))).toEqual(expect.arrayContaining(['true', 'empty-object']))
+    })
+    it('fails a floor that null widens', async () => {
+      state.floorOpens = (answer) => answer === null
+      expect(names(await runHostRuleCheck([floor()]))).toEqual(['null'])
+    })
   })
   describe('veto mode', () => {
     const veto = () => ({

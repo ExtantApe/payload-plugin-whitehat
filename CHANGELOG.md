@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Lint: empty runs and an allow list (K891, 2026-11-27).** `lintDirectory` now returns not-checked, never pass, when it reads no source files. The copyable CI test takes an explicit allow list for hits judged safe (file, rule, line text and reason, one per hit) and fails on anything else, including an entry that no longer matches. This adds no skip for code that looks safe. Tested: 151 tests pass twice (17 new), tsc and the leak check; the new tests run the CI example's own code from the docs. Not tested: the example inside another plugin repo's CI, or a live site.
+- **A floor no host answer may widen (K891, 2026-11-27).** `runHostRuleCheck` already handled this with `mayWiden: []`, so its code is unchanged. Fixture variants and tests now prove it: a floor that `true`, `{}` or null opens fails the check, and one that holds against every answer passes. The docs say to pass `mayWiden: []` for a floor, and give a copyable `lintDirectory` test for a plugin repo's CI that also fails on not-checked findings and when no files were read. Tested: 134 tests pass twice (5 new), tsc and the leak check; the new tests fail when the checker or the fixed fixture is made to let `true` widen; the copyable test was run here with its import pointed at this repo's source. Not tested: the copyable test inside another plugin repo's CI, or a live site.
+
 ## 0.4.0 (2026-11-26)
 
 - **Flags left on req.context (K768, 2026-11-25).** New `runContextLeakCheck`: runs an operation on a fresh local request and fails if `req.context` has keys added, changed or removed afterward (Payload merges a call's `context` into a shared `req`, so a plugin's skip flag turns its hooks off for the rest of the request). The lint gains rule 3, `context-on-shared-req`, for a local API call that passes `context` with the shared `req`. Tested: 129 tests pass twice (3 new runtime, 1 new lint with seven cases), tsc. Not tested: a live site.
