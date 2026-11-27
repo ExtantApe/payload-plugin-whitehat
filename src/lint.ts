@@ -137,7 +137,7 @@ export function lintSource(path: string, source: string, shared: Map<string, str
   return out
 }
 
-/** Lints every .ts, .tsx, .js, .mjs file under `dir` (skipping node_modules, dist and test folders, and symbolic links, which are never followed). Returns one pass finding when clean. */
+/** Lints every .ts, .tsx, .js, .mjs file under `dir` (skipping node_modules, dist and test folders, and symbolic links, which are never followed). Returns one pass finding when clean, and not-checked when it read no source files. */
 export function lintDirectory(dir: string): Finding[] {
   const files: string[] = []
   const walk = (d: string) => {
@@ -157,6 +157,7 @@ export function lintDirectory(dir: string): Finding[] {
   const shared = new Map<string, string>()
   for (const [, t] of texts) for (const [k, v] of collectObjects(stripComments(t))) (counts.set(k, (counts.get(k) ?? 0) + 1), shared.set(k, v))
   for (const [k, n] of counts) if (n > 1) shared.delete(k)
+  if (!files.length) return [{ check: 'plugin-source-lint', title: 'Plugin source lint', severity: 'info', status: 'not-checked', role: 'code', path: '.', how: 'Read 0 source files, so nothing was checked. Point the lint at the folder that holds the plugin’s source.' }]
   const found = texts.flatMap(([f, t]) => lintSource(relative(dir, f), t, shared))
   return found.length ? found : [{ check: 'plugin-source-lint', title: 'Plugin source lint', severity: 'info', status: 'pass', role: 'code', path: '.', how: `Read ${files.length} file${files.length === 1 ? '' : 's'}; nothing to flag.` }]
 }

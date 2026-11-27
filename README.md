@@ -2,7 +2,7 @@
 
 Whitehat for Payload: finds security holes in a Payload site, its database, code and UI, with severity-ranked alerts and a checklist that grows with every incident.
 
-**Status:** early. 0.4.0 is the latest release. Releases go to npm as `@extantape/payload-plugin-whitehat`. 134 tests.
+**Status:** early. 0.4.0 is the latest release. Releases go to npm as `@extantape/payload-plugin-whitehat`. 151 tests.
 - **The access check** works; its tests include the two real leaks it was written to catch (a private related record's id in a public read, and a refusal that answered a question it shouldn't).
 - **Checklist checks:** nine are automated, each tested against made-up responses (`CHECKLIST.md` says which).
 - **Alerts:** the collection, bulk snooze and Retest selected were tried in a real Payload admin on a local copy of a site, with made-up findings. Saving a snooze, retesting and the refusal messages worked.

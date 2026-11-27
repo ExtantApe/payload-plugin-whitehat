@@ -75,7 +75,9 @@ For a veto hook, set `kind: 'veto'`. The rule is different: `attempt` is somethi
 
 ## 5. `lintDirectory` and `lintSource`
 
-A heuristic read of source text (never an edit) of every source file, helpers included. It flags a host hook's answer used as a truth value instead of `=== true`, a paginated `payload.find` passing `req`, without `pagination: false`, as the first query of its function, and a local API call that passes both `context` and the shared `req` (`context-on-shared-req`). A `req` made with `isolateObjectProperty(req, ['context'])`, in the call or assigned to `req` earlier in the file, is skipped. A find that follows another query in the same function is skipped. Each hit names `file:line`. Limits: it can't see whether a transaction is open or what calls the function, it doesn't follow calls into other functions, and it misses a host hook held under another name. A hit says look here; a clean run isn't proof.
+A heuristic read of source text (never an edit) of every source file, helpers included. It flags a host hook's answer used as a truth value instead of `=== true`, a paginated `payload.find` passing `req`, without `pagination: false`, as the first query of its function, and a local API call that passes both `context` and the shared `req` (`context-on-shared-req`). A `req` made with `isolateObjectProperty(req, ['context'])`, in the call or assigned to `req` earlier in the file, is skipped. A find that follows another query in the same function is skipped.
+
+A run that reads no source files is `not-checked`. Each hit names `file:line`. Limits: it can't see whether a transaction is open or what calls the function, it doesn't follow calls into other functions, and it misses a host hook held under another name. A hit says look here; a clean run isn't proof.
 
 To run it on every PR, use the test file in [Running the lint in CI](#running-the-lint-in-ci).
 
@@ -100,22 +102,42 @@ The fix in the plugin is `req: isolateObjectProperty(req, ['context'])` (exporte
 The lint needs no Payload instance or database. Add `@extantape/payload-plugin-whitehat` as a dev dependency and save this as `test/whitehat-lint.test.ts`:
 
 ```ts
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { formatReport, lintDirectory } from '@extantape/payload-plugin-whitehat'
 import { expect, it } from 'vitest'
 
-it('Whitehat reads the plugin source and finds nothing', () => {
-  const findings = lintDirectory(fileURLToPath(new URL('../src', import.meta.url)))
-  // Anything but a pass fails, not-checked included.
-  expect(findings.filter((f) => f.status !== 'pass'), formatReport(findings)).toEqual([])
-  // A clean result over no files proves nothing. The pass finding says how many files were read.
-  const read = Number(/^Read (\d+) files?;/.exec(findings[0]?.how ?? '')?.[1] ?? 0)
-  expect(read, 'Whitehat read no source files').toBeGreaterThan(0)
+// Hits that someone has read and judged safe. One entry allows one hit.
+// file: relative to the scanned folder. rule: the finding's check.
+// line: the flagged line's source text, without its indentation. reason: why it is safe.
+const ALLOWED: { file: string; rule: string; line: string; reason: string }[] = []
+
+it('Whitehat reads the plugin source and finds nothing new', () => {
+  const root = fileURLToPath(new URL('../src', import.meta.url))
+  const unused = [...ALLOWED]
+  // Only a pass or an allowed hit gets through. A run that read no source files is not-checked, so it fails.
+  const unexpected = lintDirectory(root).filter((finding) => {
+    if (finding.status === 'pass') return false
+    if (finding.status !== 'fail') return true
+    const colon = finding.path.lastIndexOf(':')
+    const file = finding.path.slice(0, colon)
+    const number = Number(finding.path.slice(colon + 1))
+    const text = readFileSync(join(root, file), 'utf8').split('\n')[number - 1]?.trim()
+    const match = unused.findIndex((a) => a.file === file && a.rule === finding.check && a.line === text && a.reason.trim() !== '')
+    if (match < 0) return true
+    unused.splice(match, 1)
+    return false
+  })
+  expect(unexpected, formatReport(unexpected)).toEqual([])
+  expect(unused, 'Allowed entries that match no hit. Remove or update them.').toEqual([])
 })
 ```
 
-`lintDirectory` reports a pass for a folder with no source files, so keep the second assertion. If a later version words that finding differently, the count reads as 0 and the test fails. Point the path at the folder that holds the plugin's source. A folder that doesn't exist throws, which fails the test too.
+The lint reads text, so some hits will be false. Read the code first, then add an entry to `ALLOWED` that says why it is safe. The test fails on any other hit, on one more identical hit than you have entries for, and on an entry that matches no hit. An entry holds only the file, the rule and the flagged line's text. A change on the lines around it, or the same line moved elsewhere in that file, keeps the entry matching, so reread your entries when you edit that code.
+
+This needs a Whitehat release newer than 0.4.0: up to 0.4.0, `lintDirectory` reports a pass for a folder with no source files. Point the path at the folder that holds the plugin's source. A folder that doesn't exist throws, which fails the test too.
 
 It runs on every PR when both of these are true: the repo's Vitest `include` pattern picks up the file, and the CI workflow triggers on `pull_request` and runs `npm test` (or `pnpm -r test`) after installing dependencies. Open the first PR's log and check that the file is listed.
 

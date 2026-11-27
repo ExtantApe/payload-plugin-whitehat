@@ -2,6 +2,14 @@
 
 Newest first.
 
+## 2026-11-27 (K891, lint fixes)
+
+Suite: 134 plus 17 new tests (151, `npx vitest run`).
+
+- Covered in `test/lintShapes.test.ts`: a folder with no source files (also one holding only tests, type declarations and `node_modules`) is not-checked, and a clean folder with source passes. Code that only looks safe is still flagged: a method named like a host hook is flagged on the plugin's own class, after a bracket, `defineProperty` or `Object.assign` reassignment, and with a same-named type from another import; a paged find is flagged in a GET endpoint, inside a callback given `req`, beside a spread over `method`, and with a brace in a string before a write.
+- Covered in `test/lintCiExample.test.ts`, which runs the CI example's code as the docs print it: allowed hits pass; it fails on a hit with no entry, one identical hit too many, an entry that matches nothing, a different file, rule or line text, a blank reason, and a run that read no files.
+- Gaps skipped: the example inside another repo's Vitest setup. An allow entry doesn't pin the lines around the flagged one, and the docs say so.
+
 ## 2026-11-27 (K891): a floor no host answer may widen
 
 Suite: 129 plus 5 new tests (134, `npx vitest run`).
